@@ -1,0 +1,6 @@
+**/target/
+.tools/
+.demo/
+baseline/
+.DS_Store
+*.log
