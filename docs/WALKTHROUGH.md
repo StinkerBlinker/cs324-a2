@@ -1,7 +1,7 @@
 # Understand the demo
 
-These are study notes, not report answers. Explain the implementation in your own
-words and disclose actual AI use according to the assignment instructions.
+These notes explain the election and recovery demo, its integration points, and
+the limitations to understand when running it.
 
 1. Each worker is a separate Java process running a gRPC service. Protocol Buffers
    specify messages and generate the Java types and RPC stubs during Maven builds.

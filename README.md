@@ -96,7 +96,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\Smoke-Test.ps1
 * `ElectionNodeTest.java`: real localhost gRPC tests for selection, stale messages,
   duplicates, crash recovery, five-job rotation and quorum loss.
 * `docs/INTEGRATION.md`: contracts for Josh and Aveshal; limits to explain honestly.
-* `docs/WALKTHROUGH.md`: learning notes for the demo, not assessed report prose.
+* `docs/WALKTHROUGH.md`: explanation of the demo and its limitations.
 
 Generated protobuf/stub classes and Maven output are build artifacts and should
 not be hand edited or committed.
