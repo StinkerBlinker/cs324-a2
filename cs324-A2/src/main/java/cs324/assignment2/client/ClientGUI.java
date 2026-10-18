@@ -17,9 +17,13 @@ import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class ClientGUI extends JFrame {
 
@@ -30,17 +34,19 @@ public class ClientGUI extends JFrame {
             new String[]{"SUM", "PRIMESUM", "MAX", "PRIMECOUNT"});
     private final JTextField startField   = new JTextField("1", 6);
     private final JTextField endField     = new JTextField("50", 6);
-    private final JProgressBar progressBar = new JProgressBar(0, 1000);
     private final JTextArea logArea = new JTextArea(12, 50);
-    private final JLabel resultLabel = new JLabel("Result: —");
     private final JButton submitButton = new JButton("Submit Job");
     private final JButton loadCsvButton = new JButton("Load CSV");
     private final JButton submitQueueButton = new JButton("Submit Queue");
     private final JButton detailsButton = new JButton("Show worker details");
     private final JPanel detailsPanel = new JPanel(new BorderLayout());
+    private final JPanel jobProgressList = new JPanel();
+    private final Map<String, List<Object[]>> workerRowsByJob = new HashMap<>();
+    private final ExecutorService jobExecutor = Executors.newFixedThreadPool(4);
+    private final AtomicInteger nextJobNumber = new AtomicInteger(1);
     private final List<QueuedJob> queuedJobs = new ArrayList<>();
     private final DefaultTableModel queueTableModel = new DefaultTableModel(
-            new Object[]{"Job Type", "Input", "Status"}, 0) {
+            new Object[]{"Job #", "Job Type", "Input", "Status", "Result"}, 0) {
         @Override
         public boolean isCellEditable(int row, int column) {
             return false;
@@ -48,7 +54,7 @@ public class ClientGUI extends JFrame {
     };
     private final JTable queueTable = new JTable(queueTableModel);
     private final DefaultTableModel workerTableModel = new DefaultTableModel(
-            new Object[]{"Worker ID", "Status", "Progress", "Active Tasks",
+            new Object[]{"Job", "Worker ID", "Status", "Progress", "Active Tasks",
                     "Completed Tasks", "Metrics"}, 0) {
         @Override
         public boolean isCellEditable(int row, int column) {
@@ -56,7 +62,6 @@ public class ClientGUI extends JFrame {
         }
     };
     private final JTable workerTable = new JTable(workerTableModel);
-    private SwingWorker<Void, JobProgressUpdate> activeJob;
 
     public ClientGUI() {
         super("CS324 A2 Client");
@@ -74,17 +79,13 @@ public class ClientGUI extends JFrame {
         top.add(loadCsvButton);
         top.add(submitQueueButton);
 
-        progressBar.setStringPainted(true);
-        progressBar.setValue(0);
-        progressBar.setString("0.0%");
-
         logArea.setEditable(false);
         JScrollPane scroll = new JScrollPane(logArea);
 
-        JPanel progressPanel = new JPanel(new BorderLayout(8, 4));
-        progressPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
-        progressPanel.add(progressBar, BorderLayout.CENTER);
-        progressPanel.add(resultLabel, BorderLayout.EAST);
+        jobProgressList.setLayout(new BoxLayout(jobProgressList, BoxLayout.Y_AXIS));
+        JScrollPane jobProgressScroll = new JScrollPane(jobProgressList);
+        jobProgressScroll.setBorder(BorderFactory.createTitledBorder("Job progress"));
+        jobProgressScroll.setPreferredSize(new Dimension(750, 170));
 
         workerTable.setFillsViewportHeight(true);
         detailsPanel.add(new JScrollPane(workerTable), BorderLayout.CENTER);
@@ -98,9 +99,11 @@ public class ClientGUI extends JFrame {
 
         JSplitPane logAndQueue = new JSplitPane(JSplitPane.VERTICAL_SPLIT, scroll, queueScroll);
         logAndQueue.setResizeWeight(0.65);
+        JSplitPane progressAndWork = new JSplitPane(
+                JSplitPane.VERTICAL_SPLIT, jobProgressScroll, logAndQueue);
+        progressAndWork.setResizeWeight(0.35);
         JPanel content = new JPanel(new BorderLayout(8, 8));
-        content.add(progressPanel, BorderLayout.NORTH);
-        content.add(logAndQueue, BorderLayout.CENTER);
+        content.add(progressAndWork, BorderLayout.CENTER);
         content.add(detailsPanel, BorderLayout.SOUTH);
 
         JPanel footer = new JPanel(new BorderLayout());
@@ -114,16 +117,18 @@ public class ClientGUI extends JFrame {
         loadCsvButton.addActionListener(e -> loadCsv());
         submitQueueButton.addActionListener(e -> submitQueuedJobs());
         detailsButton.addActionListener(e -> toggleWorkerDetails());
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                jobExecutor.shutdownNow();
+            }
+        });
 
         pack();
         setLocationRelativeTo(null);
     }
 
     private void submitJob() {
-        if (activeJob != null && !activeJob.isDone()) {
-            return;
-        }
-
         String jobType = (String) jobTypeSelector.getSelectedItem();
         int start, end;
         try {
@@ -138,7 +143,7 @@ public class ClientGUI extends JFrame {
             log("Start must be less than or equal to end.");
             return;
         }
-        startJobs(List.of(QueuedJob.range(jobType, start, end)), false);
+        startJob(QueuedJob.range(jobType, start, end));
     }
 
     private void loadCsv() {
@@ -152,7 +157,8 @@ public class ClientGUI extends JFrame {
             for (QueuedJob job : loaded) {
                 job.tableRow = queueTableModel.getRowCount();
                 queuedJobs.add(job);
-                queueTableModel.addRow(new Object[]{job.jobType, job.inputDescription(), job.status});
+                queueTableModel.addRow(new Object[]{job.tableRow + 1, job.jobType,
+                        job.inputDescription(), job.status, job.result});
             }
             log("Loaded " + loaded.size() + " job(s) from "
                     + chooser.getSelectedFile().getName() + ".");
@@ -174,109 +180,83 @@ public class ClientGUI extends JFrame {
             log("There are no queued jobs to submit.");
             return;
         }
-        startJobs(pending, true);
+        pending.forEach(this::startJob);
     }
 
-    private void startJobs(List<QueuedJob> jobs, boolean continueAfterFailure) {
-        progressBar.setValue(0);
-        progressBar.setString("0.0%");
-        resultLabel.setText("Result: —");
-        workerTableModel.setRowCount(0);
-        log("Looking up coordinator via Bootstrap...");
+    private void startJob(QueuedJob job) {
+        int jobNumber = nextJobNumber.getAndIncrement();
+        JobProgressView progressView = new JobProgressView(
+                "Job " + jobNumber + " - " + job.jobType + " (" + job.inputDescription() + ")");
+        jobProgressList.add(progressView.panel);
+        jobProgressList.revalidate();
+        jobProgressList.repaint();
+        setQueueStatus(job, "Running", "—");
+        log("Job " + jobNumber + " submitted; looking up coordinator.");
+        jobExecutor.submit(() -> executeJob(job, jobNumber, progressView));
+    }
 
-        submitButton.setEnabled(false);
-        loadCsvButton.setEnabled(false);
-        submitQueueButton.setEnabled(false);
-        activeJob = new SwingWorker<>() {
-            @Override
-            protected Void doInBackground() throws Exception {
-                ManagedChannel bootstrapChannel = null;
-                ManagedChannel jobChannel = null;
-                try {
-                    bootstrapChannel = ManagedChannelBuilder
-                            .forAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT)
-                            .usePlaintext()
-                            .build();
-                    List<WorkerInfo> workers = BootstrapServiceGrpc
-                            .newBlockingStub(bootstrapChannel)
-                            .withDeadlineAfter(5, TimeUnit.SECONDS)
-                            .getActiveWorkers(GetActiveWorkersRequest.newBuilder().build())
-                            .getWorkersList();
-                    if (workers.isEmpty()) {
-                        throw new IllegalStateException("No active workers found.");
-                    }
-
-                    WorkerInfo coordinator = findCoordinator(workers);
-                    jobChannel = ManagedChannelBuilder
-                            .forAddress(coordinator.getHost(), coordinator.getPort())
-                            .usePlaintext()
-                            .build();
-                    JobServiceGrpc.JobServiceBlockingStub jobStub =
-                            JobServiceGrpc.newBlockingStub(jobChannel)
-                                    .withDeadlineAfter(10, TimeUnit.SECONDS);
-                    for (QueuedJob job : jobs) {
-                        setQueueStatus(job, "Running");
-                        try {
-                            SubmitJobResponse accepted = jobStub.submitJob(toRequest(job));
-                            publishStatus("Job " + accepted.getJobId() + " accepted: "
-                                    + accepted.getStatus());
-
-                            JobServiceGrpc.JobServiceBlockingStub progressStub =
-                                    JobServiceGrpc.newBlockingStub(jobChannel)
-                                            .withDeadlineAfter(10, TimeUnit.MINUTES);
-                            var updates = progressStub.streamJobProgress(
-                                    StreamJobProgressRequest.newBuilder()
-                                            .setJobId(accepted.getJobId())
-                                            .build());
-                            JobStatus terminalStatus = JobStatus.JOB_STATUS_UNSPECIFIED;
-                            while (updates.hasNext()) {
-                                JobProgressUpdate update = updates.next();
-                                terminalStatus = update.getStatus();
-                                publish(update);
-                            }
-                            setQueueStatus(job, terminalStatus == JobStatus.JOB_STATUS_COMPLETED
-                                    ? "Completed" : "Failed");
-                        } catch (Exception e) {
-                            setQueueStatus(job, "Failed");
-                            publishStatus("Job " + job.jobType + " failed: " + e.getMessage());
-                            if (!continueAfterFailure) {
-                                throw e;
-                            }
-                        }
-                    }
-                    return null;
-                } finally {
-                    shutdownChannel(jobChannel);
-                    shutdownChannel(bootstrapChannel);
-                }
+    private void executeJob(QueuedJob job, int jobNumber, JobProgressView progressView) {
+        ManagedChannel bootstrapChannel = null;
+        ManagedChannel jobChannel = null;
+        try {
+            bootstrapChannel = ManagedChannelBuilder
+                    .forAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT)
+                    .usePlaintext()
+                    .build();
+            List<WorkerInfo> workers = BootstrapServiceGrpc
+                    .newBlockingStub(bootstrapChannel)
+                    .withDeadlineAfter(5, TimeUnit.SECONDS)
+                    .getActiveWorkers(GetActiveWorkersRequest.newBuilder().build())
+                    .getWorkersList();
+            if (workers.isEmpty()) {
+                throw new IllegalStateException("No active workers found.");
             }
 
-            @Override
-            protected void process(List<JobProgressUpdate> updates) {
-                for (JobProgressUpdate update : updates) {
-                    showProgress(update);
-                }
-            }
+            WorkerInfo coordinator = findCoordinator(workers);
+            jobChannel = ManagedChannelBuilder
+                    .forAddress(coordinator.getHost(), coordinator.getPort())
+                    .usePlaintext()
+                    .build();
+            JobServiceGrpc.JobServiceBlockingStub jobStub =
+                    JobServiceGrpc.newBlockingStub(jobChannel)
+                            .withDeadlineAfter(10, TimeUnit.SECONDS);
+            SubmitJobResponse accepted = jobStub.submitJob(toRequest(job));
+            publishStatus("Job " + jobNumber + " accepted as " + accepted.getJobId()
+                    + ": " + accepted.getStatus());
 
-            @Override
-            protected void done() {
-                submitButton.setEnabled(true);
-                loadCsvButton.setEnabled(true);
-                submitQueueButton.setEnabled(true);
-                try {
-                    get();
-                    log("Job processing finished.");
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    log("Job monitoring was interrupted.");
-                } catch (ExecutionException e) {
-                    Throwable cause = e.getCause();
-                    log("Job monitoring failed: "
-                            + (cause == null ? e.getMessage() : cause.getMessage()));
-                }
+            JobServiceGrpc.JobServiceBlockingStub progressStub =
+                    JobServiceGrpc.newBlockingStub(jobChannel)
+                            .withDeadlineAfter(10, TimeUnit.MINUTES);
+            var updates = progressStub.streamJobProgress(
+                    StreamJobProgressRequest.newBuilder()
+                            .setJobId(accepted.getJobId())
+                            .build());
+            JobProgressUpdate terminalUpdate = null;
+            while (updates.hasNext()) {
+                JobProgressUpdate update = updates.next();
+                terminalUpdate = update;
+                showProgress(jobNumber, progressView, update);
             }
-        };
-        activeJob.execute();
+            if (terminalUpdate == null) {
+                finishJob(jobNumber, job, progressView, "Failed",
+                        "No progress result received");
+            } else if (terminalUpdate.getStatus() == JobStatus.JOB_STATUS_COMPLETED) {
+                finishJob(jobNumber, job, progressView, "Completed",
+                        Long.toString(terminalUpdate.getResult()));
+            } else {
+                String failure = terminalUpdate.getMessage().isBlank()
+                        ? terminalUpdate.getStatus().toString()
+                        : terminalUpdate.getMessage();
+                finishJob(jobNumber, job, progressView, "Failed", failure);
+            }
+        } catch (Exception e) {
+            String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            finishJob(jobNumber, job, progressView, "Failed", message);
+            publishStatus("Job " + jobNumber + " failed: " + message);
+        } finally {
+            shutdownChannel(jobChannel);
+            shutdownChannel(bootstrapChannel);
+        }
     }
 
     private static SubmitJobRequest toRequest(QueuedJob job) {
@@ -290,11 +270,14 @@ public class ClientGUI extends JFrame {
         return request.build();
     }
 
-    private void setQueueStatus(QueuedJob job, String status) {
+    private void setQueueStatus(QueuedJob job, String status, String result) {
         job.status = status;
+        job.result = result == null || result.isBlank() ? "—" : result;
         if (job.tableRow >= 0) {
-            SwingUtilities.invokeLater(() -> queueTableModel.setValueAt(
-                    status, job.tableRow, 2));
+            SwingUtilities.invokeLater(() -> {
+                queueTableModel.setValueAt(job.status, job.tableRow, 3);
+                queueTableModel.setValueAt(job.result, job.tableRow, 4);
+            });
         }
     }
 
@@ -304,6 +287,7 @@ public class ClientGUI extends JFrame {
         final int end;
         final List<Long> values;
         volatile String status = "Queued";
+        volatile String result = "—";
         int tableRow = -1;
 
         private QueuedJob(String jobType, int start, int end, List<Long> values) {
@@ -323,6 +307,21 @@ public class ClientGUI extends JFrame {
 
         String inputDescription() {
             return values.isEmpty() ? start + " .. " + end : values.toString();
+        }
+    }
+
+    private static final class JobProgressView {
+        private final JPanel panel = new JPanel(new BorderLayout(8, 4));
+        private final JProgressBar progressBar = new JProgressBar(0, 1000);
+        private final JLabel statusLabel = new JLabel("Queued");
+
+        private JobProgressView(String title) {
+            panel.setBorder(BorderFactory.createTitledBorder(title));
+            progressBar.setStringPainted(true);
+            progressBar.setString("0.0%");
+            panel.add(progressBar, BorderLayout.CENTER);
+            panel.add(statusLabel, BorderLayout.EAST);
+            panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 78));
         }
     }
 
@@ -356,13 +355,17 @@ public class ClientGUI extends JFrame {
         return fallback;
     }
 
-    private void showProgress(JobProgressUpdate update) {
+    private void showProgress(int jobNumber, JobProgressView view, JobProgressUpdate update) {
         double percentage = Math.max(0.0, Math.min(100.0, update.getCompletionPercentage()));
-        progressBar.setValue((int) Math.round(percentage * 10.0));
-        progressBar.setString(String.format("%.1f%%", percentage));
-        workerTableModel.setRowCount(0);
+        SwingUtilities.invokeLater(() -> {
+            view.progressBar.setValue((int) Math.round(percentage * 10.0));
+            view.progressBar.setString(String.format("%.1f%%", percentage));
+            view.statusLabel.setText(update.getStatus().toString());
+        });
+        List<Object[]> workerRows = new ArrayList<>();
         for (WorkerStatusMetric worker : update.getWorkersList()) {
-            workerTableModel.addRow(new Object[]{
+            workerRows.add(new Object[]{
+                    "Job " + jobNumber,
                     worker.getWorkerId(),
                     worker.getStatus(),
                     String.format("%.1f%%", worker.getCompletionPercentage()),
@@ -371,16 +374,34 @@ public class ClientGUI extends JFrame {
                     worker.getStatusMessage()
             });
         }
+        SwingUtilities.invokeLater(() -> {
+            workerRowsByJob.put(update.getJobId(), workerRows);
+            refreshWorkerTable();
+        });
+        publishStatus(String.format("Job %d: %.1f%% - %s - active workers: %d",
+                jobNumber, percentage, update.getMessage(), update.getActiveWorkerCount()));
+    }
 
-        if (update.getStatus() == JobStatus.JOB_STATUS_COMPLETED) {
-            resultLabel.setText("Result: " + update.getResult());
-        } else if (update.getStatus() == JobStatus.JOB_STATUS_FAILED) {
-            resultLabel.setText("Job failed");
-        } else if (update.getStatus() == JobStatus.JOB_STATUS_CANCELLED) {
-            resultLabel.setText("Job cancelled");
+    private void finishJob(int jobNumber, QueuedJob job, JobProgressView view,
+                           String status, String result) {
+        setQueueStatus(job, status, result);
+        SwingUtilities.invokeLater(() -> {
+            view.statusLabel.setText(status + " - " + result);
+            if ("Completed".equals(status)) {
+                view.progressBar.setValue(1000);
+                view.progressBar.setString("100.0%");
+            }
+        });
+        publishStatus("Job " + jobNumber + " " + status.toLowerCase() + ": " + result);
+    }
+
+    private void refreshWorkerTable() {
+        workerTableModel.setRowCount(0);
+        for (List<Object[]> rows : workerRowsByJob.values()) {
+            for (Object[] row : rows) {
+                workerTableModel.addRow(row);
+            }
         }
-        log(String.format("Progress %.1f%% - %s - active workers: %d",
-                percentage, update.getMessage(), update.getActiveWorkerCount()));
     }
 
     private void publishStatus(String message) {
