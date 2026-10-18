@@ -20,16 +20,24 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         implements AutoCloseable {
+
+    private static final int TASKS_PER_WORKER = 20;
+    private static final int MAX_TASK_COUNT = 10_000;
+    private static final long WORKER_TASK_TIMEOUT_SECONDS = 60L;
 
     private final WorkerNode localWorker;
     private final Map<String, JobExecution> jobs = new ConcurrentHashMap<>();
@@ -105,12 +113,10 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             return;
         }
 
-        long rangeSize = (long) end - start + 1;
-        int assignmentCount = (int) Math.min(rangeSize, workers.size());
         List<TaskAssignment> assignments = createAssignments(
-                request, jobType, start, end, workers.subList(0, assignmentCount));
+                request, jobType, start, end, workers);
         String jobId = UUID.randomUUID().toString();
-        JobExecution job = new JobExecution(jobId, assignments);
+        JobExecution job = new JobExecution(jobId, assignments, workers);
         jobs.put(jobId, job);
 
         responseObserver.onNext(SubmitJobResponse.newBuilder()
@@ -122,9 +128,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
 
         dispatchPool.execute(() -> {
             job.start();
-            for (TaskAssignment assignment : assignments) {
-                dispatchPool.execute(() -> dispatch(job, assignment));
-            }
+            schedule(job);
         });
     }
 
@@ -144,12 +148,15 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
     private List<TaskAssignment> createAssignments(SubmitJobRequest originalRequest, String jobType,
                                                    int start, int end, List<WorkerInfo> workers) {
         long rangeSize = (long) end - start + 1;
-        long baseSize = rangeSize / workers.size();
-        long extra = rangeSize % workers.size();
+        long requestedTaskCount = Math.min((long) workers.size() * TASKS_PER_WORKER,
+                MAX_TASK_COUNT);
+        int taskCount = (int) Math.min(rangeSize, requestedTaskCount);
+        long baseSize = rangeSize / taskCount;
+        long extra = rangeSize % taskCount;
         long nextStart = start;
-        List<TaskAssignment> assignments = new ArrayList<>(workers.size());
+        List<TaskAssignment> assignments = new ArrayList<>(taskCount);
 
-        for (int i = 0; i < workers.size(); i++) {
+        for (int i = 0; i < taskCount; i++) {
             long taskSize = baseSize + (i < extra ? 1 : 0);
             int taskStart = Math.toIntExact(nextStart);
             int taskEnd = Math.toIntExact(nextStart + taskSize - 1);
@@ -162,64 +169,97 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                     .putAllParameters(originalRequest.getParametersMap())
                     .setPayload(originalRequest.getPayload())
                     .build();
-            assignments.add(new TaskAssignment(workers.get(i), taskRequest));
+            assignments.add(new TaskAssignment(taskRequest));
             nextStart += taskSize;
         }
         return assignments;
     }
 
-    private void dispatch(JobExecution job, TaskAssignment assignment) {
-        job.markRunning(assignment.taskRequest.getTaskId());
+    private void dispatch(JobExecution job, TaskProgress task) {
+        TaskAttempt attempt = job.currentAttempt(task);
+        if (attempt == null) {
+            return;
+        }
         ManagedChannel channel;
         try {
-            channel = ManagedChannelBuilder
-                    .forAddress(assignment.worker.getHost(), assignment.worker.getPort())
+            channel = ManagedChannelBuilder.forAddress(
+                            attempt.worker.getHost(), attempt.worker.getPort())
                     .usePlaintext()
                     .build();
         } catch (RuntimeException e) {
-            job.markFailed(assignment.taskRequest.getTaskId(),
-                    "Could not contact worker " + assignment.worker.getId()
+            handleWorkerFailure(job, attempt,
+                    "Could not contact worker " + attempt.worker.getId()
                             + ": " + e.getMessage());
             return;
         }
 
         try {
-            WorkerServiceGrpc.newStub(channel).executeJobWithProgress(
-                    assignment.taskRequest,
+            WorkerServiceGrpc.newStub(channel)
+                    .withDeadlineAfter(WORKER_TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    .executeJobWithProgress(
+                    task.taskRequest,
                     new StreamObserver<ExecuteJobProgress>() {
                         @Override
                         public void onNext(ExecuteJobProgress update) {
                             if (!update.getErrorMessage().isEmpty()) {
-                                job.markFailed(assignment.taskRequest.getTaskId(),
-                                        update.getErrorMessage());
+                                handleWorkerFailure(job, attempt, update.getErrorMessage());
                             } else if (update.getIsFinished()) {
-                                job.markCompleted(assignment.taskRequest.getTaskId(),
-                                        update.getResult());
+                                job.completeTask(attempt, update.getResult());
+                                schedule(job);
                             } else {
-                                job.updateProgress(assignment.taskRequest.getTaskId(),
+                                job.updateProgress(attempt,
                                         update.getCompletionPercentage(), update.getResult());
                             }
                         }
 
                         @Override
                         public void onError(Throwable error) {
-                            job.markFailed(assignment.taskRequest.getTaskId(),
-                                    "Worker " + assignment.worker.getId()
+                            handleWorkerFailure(job, attempt,
+                                    "Worker " + attempt.worker.getId()
                                             + " failed: " + error.getMessage());
                             channel.shutdown();
                         }
 
                         @Override
                         public void onCompleted() {
-                            job.failIfIncomplete(assignment.taskRequest.getTaskId());
                             channel.shutdown();
+                            if (job.failIfIncomplete(attempt)) {
+                                refreshWorkersAndSchedule(job);
+                            } else {
+                                schedule(job);
+                            }
                         }
                     });
         } catch (RuntimeException e) {
-            job.markFailed(assignment.taskRequest.getTaskId(),
-                    "Could not contact worker " + assignment.worker.getId()
+            handleWorkerFailure(job, attempt,
+                    "Could not contact worker " + attempt.worker.getId()
                             + ": " + e.getMessage());
             channel.shutdown();
+        }
+    }
+
+    private void handleWorkerFailure(JobExecution job, TaskAttempt attempt, String errorMessage) {
+        if (job.requeueAfterWorkerFailure(attempt, errorMessage)) {
+            refreshWorkersAndSchedule(job);
+        }
+    }
+
+    private void refreshWorkersAndSchedule(JobExecution job) {
+        dispatchPool.execute(() -> {
+            try {
+                job.addAvailableWorkers(localWorker.getActiveWorkersFromBootstrap());
+            } catch (RuntimeException refreshError) {
+                System.err.println("Could not refresh workers after task failure: "
+                        + refreshError.getMessage());
+            }
+            job.failIfNoWorkersCanContinue();
+            schedule(job);
+        });
+    }
+
+    private void schedule(JobExecution job) {
+        for (TaskProgress task : job.assignPendingTasks()) {
+            dispatchPool.execute(() -> dispatch(job, task));
         }
     }
 
@@ -229,45 +269,73 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
     }
 
     private static final class TaskAssignment {
-        private final WorkerInfo worker;
         private final ExecuteJobRequest taskRequest;
 
-        private TaskAssignment(WorkerInfo worker, ExecuteJobRequest taskRequest) {
-            this.worker = worker;
+        private TaskAssignment(ExecuteJobRequest taskRequest) {
             this.taskRequest = taskRequest;
         }
     }
 
     private static final class TaskProgress {
-        private final WorkerInfo worker;
+        private WorkerInfo worker;
         private final String taskId;
+        private final ExecuteJobRequest taskRequest;
         private final long totalWork;
         private SubTaskState state = SubTaskState.SUB_TASK_STATE_PENDING;
         private WorkerStatus workerStatus = WorkerStatus.WORKER_STATUS_IDLE;
         private double completionPercentage;
+        private int attemptNumber;
         private long result;
         private String message = "Waiting for assignment";
 
         private TaskProgress(TaskAssignment assignment) {
-            worker = assignment.worker;
+            taskRequest = assignment.taskRequest;
             taskId = assignment.taskRequest.getTaskId();
             totalWork = (long) assignment.taskRequest.getEnd()
                     - assignment.taskRequest.getStart() + 1;
         }
     }
 
+    private static final class TaskAttempt {
+        private final TaskProgress task;
+        private final WorkerInfo worker;
+        private final int attemptNumber;
+
+        private TaskAttempt(TaskProgress task, WorkerInfo worker, int attemptNumber) {
+            this.task = task;
+            this.worker = worker;
+            this.attemptNumber = attemptNumber;
+        }
+    }
+
     private static final class JobExecution {
         private final String jobId;
         private final Map<String, TaskProgress> tasks = new LinkedHashMap<>();
+        private final ArrayDeque<TaskProgress> pendingTasks = new ArrayDeque<>();
         private final List<StreamObserver<JobProgressUpdate>> subscribers = new ArrayList<>();
+        private final Map<Integer, WorkerInfo> workers = new LinkedHashMap<>();
+        private final Map<Integer, String> activeTasksByWorker = new LinkedHashMap<>();
+        private final Set<Integer> failedWorkerIds = new HashSet<>();
         private JobStatus status = JobStatus.JOB_STATUS_QUEUED;
         private String message = "Job accepted and queued";
 
-        private JobExecution(String jobId, List<TaskAssignment> assignments) {
+        private JobExecution(String jobId, List<TaskAssignment> assignments,
+                             List<WorkerInfo> availableWorkers) {
             this.jobId = jobId;
+            addAvailableWorkers(availableWorkers);
             for (TaskAssignment assignment : assignments) {
                 TaskProgress task = new TaskProgress(assignment);
                 tasks.put(task.taskId, task);
+                pendingTasks.addLast(task);
+            }
+        }
+
+        private synchronized void addAvailableWorkers(List<WorkerInfo> availableWorkers) {
+            for (WorkerInfo worker : availableWorkers) {
+                if (worker.getId() > 0 && worker.getPort() > 0 && !worker.getHost().isBlank()
+                        && !failedWorkerIds.contains(worker.getId())) {
+                    workers.put(worker.getId(), worker);
+                }
             }
         }
 
@@ -289,26 +357,48 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             publish();
         }
 
-        private synchronized void markRunning(String taskId) {
+        private synchronized List<TaskProgress> assignPendingTasks() {
+            List<TaskProgress> assigned = new ArrayList<>();
             if (isTerminal()) {
-                return;
+                return assigned;
             }
-            TaskProgress task = tasks.get(taskId);
-            if (task == null || task.state != SubTaskState.SUB_TASK_STATE_PENDING) {
-                return;
+            for (WorkerInfo worker : workers.values()) {
+                if (failedWorkerIds.contains(worker.getId())
+                        || activeTasksByWorker.containsKey(worker.getId())) {
+                    continue;
+                }
+                TaskProgress task = pendingTasks.pollFirst();
+                if (task == null) {
+                    break;
+                }
+                task.worker = worker;
+                task.state = SubTaskState.SUB_TASK_STATE_RUNNING;
+                task.workerStatus = WorkerStatus.WORKER_STATUS_ACTIVE;
+                task.message = "Executing";
+                activeTasksByWorker.put(worker.getId(), task.taskId);
+                task.attemptNumber++;
+                assigned.add(task);
             }
-            task.state = SubTaskState.SUB_TASK_STATE_RUNNING;
-            task.workerStatus = WorkerStatus.WORKER_STATUS_ACTIVE;
-            task.message = "Executing";
-            publish();
+            if (!assigned.isEmpty()) {
+                publish();
+            }
+            return assigned;
         }
 
-        private synchronized void updateProgress(String taskId, double percentage, long result) {
+        private synchronized TaskAttempt currentAttempt(TaskProgress task) {
+            if (task.state != SubTaskState.SUB_TASK_STATE_RUNNING || task.worker == null) {
+                return null;
+            }
+            return new TaskAttempt(task, task.worker, task.attemptNumber);
+        }
+
+        private synchronized void updateProgress(TaskAttempt attempt,
+                                                 double percentage, long result) {
             if (isTerminal()) {
                 return;
             }
-            TaskProgress task = tasks.get(taskId);
-            if (task == null || task.state != SubTaskState.SUB_TASK_STATE_RUNNING) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
                 return;
             }
             task.completionPercentage = Math.max(0.0, Math.min(100.0, percentage));
@@ -316,12 +406,12 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             publish();
         }
 
-        private synchronized void markCompleted(String taskId, long result) {
+        private synchronized void completeTask(TaskAttempt attempt, long result) {
             if (isTerminal()) {
                 return;
             }
-            TaskProgress task = tasks.get(taskId);
-            if (task == null || isTaskTerminal(task.state)) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
                 return;
             }
             task.result = result;
@@ -329,34 +419,76 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             task.state = SubTaskState.SUB_TASK_STATE_COMPLETED;
             task.workerStatus = WorkerStatus.WORKER_STATUS_IDLE;
             task.message = "Completed";
+            activeTasksByWorker.remove(attempt.worker.getId(), task.taskId);
+            failIfNoWorkersCanContinue();
             updateTerminalStatus();
             publish();
         }
 
-        private synchronized void markFailed(String taskId, String errorMessage) {
+        private synchronized boolean requeueAfterWorkerFailure(TaskAttempt attempt,
+                                                               String errorMessage) {
             if (isTerminal()) {
-                return;
+                return false;
             }
-            TaskProgress task = tasks.get(taskId);
-            if (task == null || isTaskTerminal(task.state)) {
-                return;
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
+                return false;
             }
-            task.state = SubTaskState.SUB_TASK_STATE_FAILED;
+            int failedWorkerId = attempt.worker.getId();
+            failedWorkerIds.add(failedWorkerId);
+            workers.remove(failedWorkerId);
+            activeTasksByWorker.remove(failedWorkerId, task.taskId);
+            task.worker = null;
+            task.state = SubTaskState.SUB_TASK_STATE_PENDING;
             task.workerStatus = WorkerStatus.WORKER_STATUS_FAILED;
+            task.completionPercentage = 0.0;
+            task.result = 0L;
             task.message = errorMessage;
-            message = errorMessage;
-            status = JobStatus.JOB_STATUS_FAILED;
+            message = "Worker " + failedWorkerId + " failed; retrying unfinished sub-task";
+            pendingTasks.addFirst(task);
             publish();
+            return !isTerminal();
         }
 
-        private synchronized void failIfIncomplete(String taskId) {
-            TaskProgress task = tasks.get(taskId);
-            if (task != null && !isTaskTerminal(task.state)) {
-                markFailed(taskId, "Worker stream ended before the sub-task completed");
+        private synchronized boolean failIfIncomplete(TaskAttempt attempt) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (isCurrentAttempt(task, attempt)) {
+                return requeueAfterWorkerFailure(attempt,
+                        "Worker stream ended before the sub-task completed");
+            }
+            return false;
+        }
+
+        private boolean isCurrentAttempt(TaskProgress task, TaskAttempt attempt) {
+            return task != null
+                    && task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                    && task.attemptNumber == attempt.attemptNumber
+                    && task.worker != null
+                    && task.worker.getId() == attempt.worker.getId();
+        }
+
+        private synchronized void failIfNoWorkersCanContinue() {
+            failIfNoWorkersCanContinueLocked();
+            if (isTerminal()) {
+                publish();
+            }
+        }
+
+        private void failPendingTasks(String reason) {
+            status = JobStatus.JOB_STATUS_FAILED;
+            message = reason;
+            pendingTasks.clear();
+            for (TaskProgress task : tasks.values()) {
+                if (task.state == SubTaskState.SUB_TASK_STATE_PENDING) {
+                    task.state = SubTaskState.SUB_TASK_STATE_FAILED;
+                    task.workerStatus = WorkerStatus.WORKER_STATUS_UNAVAILABLE;
+                    task.message = reason;
+                }
             }
         }
 
         private void updateTerminalStatus() {
+            failIfNoWorkersCanContinueLocked();
             boolean allTerminal = tasks.values().stream().allMatch(task -> isTaskTerminal(task.state));
             if (!allTerminal) {
                 status = JobStatus.JOB_STATUS_RUNNING;
@@ -366,6 +498,12 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                     .anyMatch(task -> task.state == SubTaskState.SUB_TASK_STATE_FAILED);
             status = failed ? JobStatus.JOB_STATUS_FAILED : JobStatus.JOB_STATUS_COMPLETED;
             message = failed ? "One or more sub-tasks failed" : "Job completed";
+        }
+
+        private void failIfNoWorkersCanContinueLocked() {
+            if (!pendingTasks.isEmpty() && workers.isEmpty() && activeTasksByWorker.isEmpty()) {
+                failPendingTasks("No healthy workers remain to retry unfinished sub-tasks");
+            }
         }
 
         private boolean isTerminal() {
@@ -388,30 +526,32 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             long totalWork = 0;
             double completedWork = 0.0;
             long totalResult = 0L;
-            int activeWorkers = 0;
+            int activeWorkers = activeTasksByWorker.size();
 
             for (TaskProgress task : tasks.values()) {
                 totalWork += task.totalWork;
                 completedWork += task.totalWork * task.completionPercentage / 100.0;
                 totalResult += task.result;
-                if (task.workerStatus == WorkerStatus.WORKER_STATUS_ACTIVE) {
-                    activeWorkers++;
+                if (task.worker != null) {
+                    update.addWorkers(WorkerStatusMetric.newBuilder()
+                            .setWorkerId(task.worker.getId())
+                            .setStatus(task.workerStatus)
+                            .setCompletionPercentage(task.completionPercentage)
+                            .setActiveSubTaskCount(
+                                    task.state == SubTaskState.SUB_TASK_STATE_RUNNING ? 1 : 0)
+                            .setCompletedSubTaskCount(
+                                    task.state == SubTaskState.SUB_TASK_STATE_COMPLETED ? 1 : 0)
+                            .setStatusMessage(task.message));
                 }
-                update.addWorkers(WorkerStatusMetric.newBuilder()
-                        .setWorkerId(task.worker.getId())
-                        .setStatus(task.workerStatus)
-                        .setCompletionPercentage(task.completionPercentage)
-                        .setActiveSubTaskCount(
-                                task.state == SubTaskState.SUB_TASK_STATE_RUNNING ? 1 : 0)
-                        .setCompletedSubTaskCount(
-                                task.state == SubTaskState.SUB_TASK_STATE_COMPLETED ? 1 : 0)
-                        .setStatusMessage(task.message));
-                update.addSubTasks(SubTaskStatus.newBuilder()
+                SubTaskStatus.Builder subTask = SubTaskStatus.newBuilder()
                         .setSubTaskId(task.taskId)
                         .setState(task.state)
                         .setCompletionPercentage(task.completionPercentage)
-                        .setWorkerId(task.worker.getId())
-                        .setMessage(task.message));
+                        .setMessage(task.message);
+                if (task.worker != null) {
+                    subTask.setWorkerId(task.worker.getId());
+                }
+                update.addSubTasks(subTask);
             }
             double completionPercentage = completedWork * 100.0 / totalWork;
             if (status == JobStatus.JOB_STATUS_COMPLETED) {
