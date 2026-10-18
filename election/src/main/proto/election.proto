@@ -1,0 +1,31 @@
+syntax = "proto3";
+package cs324.election.v1;
+option java_package = "cs324.election.proto";
+option java_multiple_files = true;
+
+message Empty {}
+message Worker { int32 id = 1; string host = 2; int32 port = 3; }
+// Logical counter plus initiator ID gives a total order without wall-clock ordering.
+message Round { int64 counter = 1; int32 initiator_id = 2; }
+message Election { Round round = 1; Worker initiator = 2; }
+message Candidate { Round round = 1; Worker worker = 2; int64 jac = 3; }
+message Coordinator { Round round = 1; Worker worker = 2; }
+message Ack { bool accepted = 1; string detail = 2; }
+message NodeStatus {
+  Worker self = 1; Round round = 2; Worker coordinator = 3;
+  int64 jac = 4; int32 jobs_this_term = 5; bool ready = 6;
+}
+// Opaque job-engine checkpoint. Payload must include input, task identities,
+// accepted results and progress; completed jobs must remain as deduplication records.
+message RecoveryRecord { string key = 1; bytes payload = 2; Round round = 3; int64 revision = 4; }
+message RecoverySnapshot { repeated RecoveryRecord records = 1; }
+message Checkpoint { string key = 1; bytes payload = 2; }
+service LeaderElection {
+  rpc ReceiveElection(Election) returns (Ack);
+  rpc ReportCandidacy(Candidate) returns (Ack);
+  rpc AnnounceCoordinator(Coordinator) returns (Ack);
+  rpc GetStatus(Empty) returns (NodeStatus);
+  rpc ReadRecovery(Empty) returns (RecoverySnapshot);
+  rpc ReplicateRecord(RecoveryRecord) returns (Ack);
+  rpc SaveCheckpoint(Checkpoint) returns (Ack);
+}

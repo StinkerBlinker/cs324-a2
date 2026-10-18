@@ -1,0 +1,6 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>fj.usp.cs324</groupId><artifactId>cs324-a2</artifactId><version>1.0-SNAPSHOT</version><packaging>pom</packaging>
+  <modules><module>election</module></modules>
+  <properties><maven.compiler.release>24</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding><grpc.version>1.75.0</grpc.version><protobuf.version>4.32.0</protobuf.version></properties>
+</project>
