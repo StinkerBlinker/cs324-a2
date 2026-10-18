@@ -1,6 +1,12 @@
 package cs324.assignment2.client;
 
 import cs324.assignment2.grpc.*;
+import cs324.assignment2.job.grpc.JobProgressUpdate;
+import cs324.assignment2.job.grpc.JobServiceGrpc;
+import cs324.assignment2.job.grpc.JobStatus;
+import cs324.assignment2.job.grpc.StreamJobProgressRequest;
+import cs324.assignment2.job.grpc.SubmitJobRequest;
+import cs324.assignment2.job.grpc.SubmitJobResponse;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.stub.StreamObserver;
@@ -127,47 +133,77 @@ public class ClientGUI extends JFrame {
                         .forAddress(coordinatorInfo.getHost(), coordinatorInfo.getPort())
                         .usePlaintext()
                         .build();
-                WorkerServiceGrpc.WorkerServiceStub asyncStub =
-                        WorkerServiceGrpc.newStub(jobCh);
+                JobServiceGrpc.JobServiceStub asyncStub = JobServiceGrpc.newStub(jobCh);
 
                 CountDownLatch latch = new CountDownLatch(1);
 
                 asyncStub.submitJob(
                         SubmitJobRequest.newBuilder()
                                 .setJobType(jobType)
-                                .setStart(start)
-                                .setEnd(end)
+                                .putParameters("start", Integer.toString(start))
+                                .putParameters("end", Integer.toString(end))
                                 .build(),
-                        new StreamObserver<JobProgressUpdate>() {
+                        new StreamObserver<SubmitJobResponse>() {
                             @Override
-                            public void onNext(JobProgressUpdate update) {
-                                SwingUtilities.invokeLater(() -> {
-                                    progressBar.setValue((int) update.getOverallPercent());
-                                    if (update.getIsFinished()) {
-                                        resultLabel.setText("Result: " + update.getFinalResult());
-                                    }
-                                    if (!update.getWorkersList().isEmpty()) {
-                                        StringBuilder sb = new StringBuilder("Workers: ");
-                                        for (WorkerProgress wp : update.getWorkersList()) {
-                                            sb.append("[W").append(wp.getWorkerId())
-                                              .append(" ").append(String.format("%.0f", wp.getPercentDone()))
-                                              .append("% ").append(wp.getStatus()).append("] ");
-                                        }
-                                        log(sb.toString());
-                                    }
-                                });
+                            public void onNext(SubmitJobResponse response) {
+                                log("Job " + response.getJobId() + " accepted: "
+                                        + response.getStatus());
+                                asyncStub.streamJobProgress(
+                                        StreamJobProgressRequest.newBuilder()
+                                                .setJobId(response.getJobId())
+                                                .build(),
+                                        new StreamObserver<JobProgressUpdate>() {
+                                            @Override
+                                            public void onNext(JobProgressUpdate update) {
+                                                SwingUtilities.invokeLater(() -> {
+                                                    progressBar.setValue((int) update
+                                                            .getCompletionPercentage());
+                                                    if (update.getStatus()
+                                                            == JobStatus.JOB_STATUS_COMPLETED) {
+                                                        resultLabel.setText("Result: "
+                                                                + update.getResult());
+                                                    } else if (update.getStatus()
+                                                            == JobStatus.JOB_STATUS_FAILED) {
+                                                        resultLabel.setText("Job failed");
+                                                    }
+
+                                                    StringBuilder sb = new StringBuilder(
+                                                            String.format("Progress: %.0f%%, active workers: %d",
+                                                                    update.getCompletionPercentage(),
+                                                                    update.getActiveWorkerCount()));
+                                                    for (var worker : update.getWorkersList()) {
+                                                        sb.append(" [W").append(worker.getWorkerId())
+                                                          .append(" ").append(String.format("%.0f",
+                                                                  worker.getCompletionPercentage()))
+                                                          .append("% ").append(worker.getStatus()).append("]");
+                                                    }
+                                                    log(sb.toString());
+                                                });
+                                            }
+
+                                            @Override
+                                            public void onError(Throwable t) {
+                                                log("Progress stream failed: " + t.getMessage());
+                                                latch.countDown();
+                                            }
+
+                                            @Override
+                                            public void onCompleted() {
+                                                log("Job stream completed.");
+                                                latch.countDown();
+                                            }
+                                        });
                             }
 
                             @Override
                             public void onError(Throwable t) {
-                                log("Job failed: " + t.getMessage());
+                                log("Job submission failed: " + t.getMessage());
                                 latch.countDown();
                             }
 
                             @Override
                             public void onCompleted() {
-                                log("Job stream completed.");
-                                latch.countDown();
+                                // The progress stream completes the job lifecycle.
                             }
                         });
 
