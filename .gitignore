@@ -4,3 +4,8 @@
 baseline/
 .DS_Store
 *.log
+target/
+.DS_Store
+.idea/
+.vscode/
+.env

@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "cs324.assignment2.grpc";
+option java_outer_classname = "WorkerProto";
+
+package worker;
+
+import "bootstrap.proto";
+
+service WorkerService {
+  // Networking (Josh)
+  rpc AddNeighbour (AddNeighbourRequest) returns (AddNeighbourResponse);
+  rpc GetId (GetIdRequest) returns (GetIdResponse);
+  rpc GetCoordinatorId (GetCoordinatorIdRequest) returns (GetCoordinatorIdResponse);
+  rpc GetJac (GetJacRequest) returns (GetJacResponse);
+
+  // Leader Election (Pranay)
+  rpc ReceiveElectionMessage (ElectionMessage) returns (Empty);
+  rpc ReportCandidacy (CandidacyReport) returns (Empty);
+  rpc ReceiveCoordinatorMessage (CoordinatorMessage) returns (Empty);
+
+  // Job execution (Aveshal)
+  rpc ExecuteJob (ExecuteJobRequest) returns (ExecuteJobResponse);
+  rpc SubmitJob (SubmitJobRequest) returns (stream JobProgressUpdate);
+}
+
+message Empty {}
+
+message AddNeighbourRequest {
+  bootstrap.WorkerInfo neighbour = 1;
+}
+message AddNeighbourResponse {}
+
+message GetIdRequest {}
+message GetIdResponse {
+  int32 id = 1;
+}
+
+message GetCoordinatorIdRequest {}
+message GetCoordinatorIdResponse {
+  int32 coordinator_id = 1;
+}
+
+message GetJacRequest {}
+message GetJacResponse {
+  int32 jac = 1;
+}
+
+message ElectionMessage {
+  string election_id = 1;
+  bootstrap.WorkerInfo initiator = 2;
+}
+
+message CandidacyReport {
+  bootstrap.WorkerInfo candidate = 1;
+  int32 jac = 2;
+  string election_id = 3;
+}
+
+message CoordinatorMessage {
+  string election_id = 1;
+  bootstrap.WorkerInfo coordinator = 2;
+}
+
+message ExecuteJobRequest {
+  string job_type = 1;
+  int32  start    = 2;
+  int32  end      = 3;
+  string task_id  = 4;
+}
+
+message ExecuteJobResponse {
+  int64 result = 1;
+  string task_id = 2;
+}
+
+message SubmitJobRequest {
+  string job_type = 1;
+  int32  start    = 2;
+  int32  end      = 3;
+}
+
+message JobProgressUpdate {
+  double overall_percent = 1;
+  int64  final_result    = 2;
+  bool   is_finished     = 3;
+  repeated WorkerProgress workers = 4;
+}
+
+message WorkerProgress {
+  int32  worker_id     = 1;
+  double percent_done  = 2;
+  string status        = 3;
+}

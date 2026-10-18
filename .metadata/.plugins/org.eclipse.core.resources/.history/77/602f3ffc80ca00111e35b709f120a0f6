@@ -1,0 +1,5 @@
+package cs324.assignment2.worker;
+
+public class WorkerNode {
+
+}
