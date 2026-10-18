@@ -15,6 +15,7 @@ message SubmitJobRequest {
   string job_type = 1;
   map<string, string> parameters = 2;
   bytes payload = 3;
+  repeated int64 values = 4;
 }
 
 message SubmitJobResponse {
