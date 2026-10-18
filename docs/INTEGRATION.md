@@ -109,10 +109,11 @@ completed job records for request deduplication. No exactly-once task execution 
 provided by the checkpoint layer itself.
 
 Do not block election/heartbeat threads with numerical computation. Use a separate
-executor. WorkerService execute RPCs now run SUM/PRIMESUM; JobService handles
+executor. WorkerService execute RPCs now run SUM/PRIMESUM/MAX/PRIMECOUNT; JobService handles
 submission/progress. The old WorkerService SubmitJob remains UNIMPLEMENTED and
-is not used by the GUI. The range-only jobs still need true list input support
-for MAX and PRIMECOUNT, CSV samples/loading and multiple concurrent GUI job rows.
+is not used by the GUI. List values are carried through task partitioning and replicated checkpoints.
+MAX combines task maxima (including negative-only lists); PRIMECOUNT counts duplicate
+prime occurrences. CsvJobLoader and sample_jobs.csv feed concurrent GUI job rows.
 Worker details can be opened by clicking the progress bar or its details button.
 
 ## Remaining boundaries
@@ -124,3 +125,13 @@ registration expires must stop and rejoin with a new ID; it does not silently
 resume using its old identity. Live joins are tested with checkpoint state;
 coordinator failover is also tested during a real numerical job with retained
 completed subtasks and correct final aggregation.
+
+## Latest-main integration
+
+Aveshal's PR #4 (`fcfa3bb`) is integrated with worker-owned election and checkpoint
+recovery. JobService SubmitJobRequest reserves tag 4 for repeated int64 values and
+tag 5 for stable request_id. Rebuild every client/worker before running this version;
+these stubs must not be mixed with previous local builds. Every GUI monitor uses
+ResilientJobClient while keeping its own progress row. Four jobs can be monitored
+concurrently. Both the full original list and each partition's list values are
+retained in PersistedJob/PersistedTask for coordinator recovery.

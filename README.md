@@ -105,9 +105,13 @@ After starting bootstrap and at least three workers, launch the client:
 java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.client.ClientGUI
 ```
 
-The GUI submits range jobs and displays measured streamed progress; click the
-progress bar or the details button for the worker breakdown. It automatically
-rediscovers the coordinator and reconnects using the same job ID after failover.
+The GUI supports SUM, PRIMESUM, MAX and PRIMECOUNT. Use **Load CSV** to open
+`sample_jobs.csv` from the repository root, then **Submit Queue**. List values
+remain unsorted and duplicate prime occurrences are counted individually. Manual
+Start/End input submits a range; CSV's quoted `values` column submits explicit lists.
+Each job has its own measured progress bar; up to four client monitors run at once.
+Click a progress bar or the details button to expand the worker breakdown.
+Every monitor rediscovers and reconnects with its original request ID after failover.
 For a command-line computation with the same reconnect behaviour:
 
 ```powershell
@@ -120,11 +124,12 @@ Admission, task assignment/completion and failure transitions are checkpointed.
 On failover completed task results are retained; unfinished tasks restart with new
 attempt identities. Partial in-flight progress can decrease when work is retried.
 
-Aveshal's job service currently supports range-based SUM and PRIMESUM. The required
-MAX and PRIMECOUNT over unsorted lists, sample CSV/loading, and multiple concurrent
-jobs in one GUI still need work. The GUI presently monitors one job at a time;
-separate clients and backend jobs can execute concurrently. The old WorkerService
-SubmitJob RPC is deprecated/UNIMPLEMENTED; use the JobService API used by the GUI.
+The old WorkerService SubmitJob RPC remains UNIMPLEMENTED; the GUI uses JobService.
+All processes must rebuild from the merged proto files: job submission uses
+`values = 4` and `request_id = 5`. Mixed older stubs are incompatible.
+The integrated runnable application is `cs324-A2`; `election/` is the older standalone
+demonstration with static membership stubs, and is not used by the integrated GUI.
+The root Maven build includes both modules.
 
 Bootstrap must remain available and retain its worker registry. Full-cluster/bootstrap
 restart recovery, TLS/authentication and replicated bootstrap are not implemented.

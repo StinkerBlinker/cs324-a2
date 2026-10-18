@@ -86,6 +86,7 @@ message ExecuteJobRequest {
   string task_id  = 4;
   map<string, string> parameters = 5;
   bytes payload = 6;
+  repeated int64 values = 7;
 }
 
 message ExecuteJobResponse {

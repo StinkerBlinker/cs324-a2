@@ -178,6 +178,37 @@ class IntegratedClusterTest {
         assertEquals(2, worker.getJac().get());
         assertEquals(0, stub(worker).getWorkerStatus(GetWorkerStatusRequest.getDefaultInstance()).getJobsThisTerm());
     }
+    @Test void concurrentListJobsPreserveInputsAndResultsAcrossCoordinatorChange() throws Exception {
+        add(0); add(0); WorkerNode leader = add(0); ready(3, 3);
+        var maximum = cs324.assignment2.job.grpc.SubmitJobRequest.newBuilder().setJobType("MAX")
+                .setRequestId("negative-list-max").addAllValues(List.of(-9L, -4L, -21L, -3L, -21L)).build();
+        var count = cs324.assignment2.job.grpc.SubmitJobRequest.newBuilder().setJobType("PRIMECOUNT")
+                .setRequestId("duplicate-primes").addAllValues(List.of(2L, 3L, 3L, 4L, 5L, 5L, 5L, -7L)).build();
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(2);
+        try {
+            var maxResult = pool.submit(() -> cs324.assignment2.client.ResilientJobClient.run(
+                    "localhost", bootstrapServer.getPort(), maximum, update -> {}, 20000));
+            var countResult = pool.submit(() -> cs324.assignment2.client.ResilientJobClient.run(
+                    "localhost", bootstrapServer.getPort(), count, update -> {}, 20000));
+            assertEquals(-3, maxResult.get(25, TimeUnit.SECONDS).getResult());
+            assertEquals(6, countResult.get(25, TimeUnit.SECONDS).getResult());
+            long oldEpoch = view().getEpoch();
+            leader.crash(); ready(2, 2);
+            assertTrue(view().getEpoch() > oldEpoch);
+            for (var request : List.of(maximum, count)) {
+                var repeated = cs324.assignment2.client.ResilientJobClient.run("localhost", bootstrapServer.getPort(),
+                        request, update -> {}, 20000);
+                assertEquals(request.getRequestId(), repeated.getJobId());
+                assertEquals(request.getJobType().equals("MAX") ? -3 : 6, repeated.getResult());
+                var record = read(workers.get(1)).getRecordsList().stream()
+                        .filter(r -> r.getKey().equals("job/" + request.getRequestId())).findFirst().orElseThrow();
+                var saved = cs324.assignment2.job.grpc.PersistedJob.parseFrom(record.getPayload());
+                assertEquals(request, saved.getOriginalRequest());
+                assertEquals(request.getValuesList(), saved.getTasksList().stream()
+                        .flatMap(t -> t.getRequest().getValuesList().stream()).toList());
+            }
+        } finally { pool.shutdownNow(); }
+    }
     @Test void realPrimeJobResumesAfterCoordinatorCrashWithoutLosingCompletedTasks() throws Exception {
         add(0); add(0); WorkerNode oldLeader = add(0); ready(3, 3);
         ManagedChannel oldChannel = ManagedChannelBuilder.forAddress("localhost", oldLeader.selfInfo().getPort()).usePlaintext().build();

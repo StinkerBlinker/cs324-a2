@@ -5,14 +5,14 @@ import io.grpc.Context;
 import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
-/** Aveshal's measured range computation, shared by unary and streaming RPCs. */
+/** Measured range/list computation, shared by unary and streaming RPCs. */
 final class TaskExecution {
     private TaskExecution() {}
     private interface Progress { void update(double percentage, long value); }
     private static void validate(ExecuteJobRequest req) {
-        if (!req.getJobType().equalsIgnoreCase("SUM") && !req.getJobType().equalsIgnoreCase("PRIMESUM"))
-            throw new IllegalArgumentException("Supported range job types are SUM and PRIMESUM");
-        if (req.getStart() > req.getEnd()) throw new IllegalArgumentException("start must not exceed end");
+        if (!java.util.Set.of("SUM", "PRIMESUM", "MAX", "PRIMECOUNT").contains(req.getJobType().toUpperCase()))
+            throw new IllegalArgumentException("Supported job types are SUM, PRIMESUM, MAX and PRIMECOUNT");
+        if (req.getValuesCount() == 0 && req.getStart() > req.getEnd()) throw new IllegalArgumentException("start must not exceed end");
     }
     static void execute(ExecuteJobRequest req, StreamObserver<ExecuteJobResponse> out) {
         try {
@@ -31,12 +31,18 @@ final class TaskExecution {
         } catch (RuntimeException error) { fail(out,error); }
     }
     private static long calculate(ExecuteJobRequest req, Progress progress) {
-        long total=(long)req.getEnd()-req.getStart()+1;
-        long interval=Math.max(1,(total+99)/100), done=0, result=0;
+        boolean list=req.getValuesCount()>0;
+        long total=list ? req.getValuesCount() : (long)req.getEnd()-req.getStart()+1;
+        boolean maximum=req.getJobType().equalsIgnoreCase("MAX");
+        boolean count=req.getJobType().equalsIgnoreCase("PRIMECOUNT");
+        long interval=Math.max(1,(total+99)/100), done=0, result=maximum ? Long.MIN_VALUE : 0;
         boolean primes=req.getJobType().equalsIgnoreCase("PRIMESUM");
-        for (long number=req.getStart(); number<=req.getEnd(); number++) {
+        for (long index=0; index<total; index++) {
             if (Thread.currentThread().isInterrupted()) throw new IllegalStateException("Worker computation interrupted");
-            if (!primes || isPrime(number)) result=Math.addExact(result,number);
+            long number=list ? req.getValues(Math.toIntExact(index)) : (long)req.getStart()+index;
+            if (maximum) result=Math.max(result,number);
+            else if (count) { if (isPrime(number)) result=Math.addExact(result,1); }
+            else if (!primes || isPrime(number)) result=Math.addExact(result,number);
             if (++done%interval==0 || done==total) progress.update(done*100.0/total,result);
         }
         return result;

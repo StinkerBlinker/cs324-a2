@@ -112,6 +112,46 @@ class JobGrpcServiceImplTest {
     }
 
     @Test
+    @Timeout(30)
+    void maxAndPrimeCountHandleUnsortedValuesAndPreserveDuplicates() throws Exception {
+        var maxResponse = jobStub.submitJob(valueJobRequest("MAX", 9, -4, 21, 3, 21));
+        var primeCountResponse = jobStub.submitJob(
+                valueJobRequest("PRIMECOUNT", 2, 3, 3, 4, 5, 5, 5));
+
+        JobProgressUpdate maxResult = lastProgress(maxResponse.getJobId());
+        JobProgressUpdate primeCountResult = lastProgress(primeCountResponse.getJobId());
+
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, maxResult.getStatus());
+        assertEquals(21L, maxResult.getResult());
+        assertEquals(JobStatus.JOB_STATUS_COMPLETED, primeCountResult.getStatus());
+        assertEquals(6L, primeCountResult.getResult());
+    }
+
+    @Test
+    @Timeout(15)
+    void workerProcessesUnsortedMaxAndDuplicatePrimeValues() throws Exception {
+        WorkerNode worker = new WorkerNode();
+        Server workerServer = ServerBuilder.forPort(0).addService(worker).build().start();
+        workerServers.add(workerServer);
+        ManagedChannel channel = ManagedChannelBuilder
+                .forAddress("localhost", workerServer.getPort())
+                .usePlaintext()
+                .build();
+        channels.add(channel);
+        WorkerServiceGrpc.WorkerServiceBlockingStub workerStub = WorkerServiceGrpc
+                .newBlockingStub(channel)
+                .withDeadlineAfter(5, TimeUnit.SECONDS);
+
+        ExecuteJobProgress maxResult = lastWorkerProgress(workerStub,
+                workerRequest("MAX", 19, -2, 7, 31, 7));
+        ExecuteJobProgress primeCountResult = lastWorkerProgress(workerStub,
+                workerRequest("PRIMECOUNT", 2, 3, 3, 4, 5, 5, 5));
+
+        assertEquals(31L, maxResult.getResult());
+        assertEquals(6L, primeCountResult.getResult());
+    }
+
+    @Test
     void rejectsSubmissionWhenThisWorkerIsNotCoordinator() {
         WorkerNode nonCoordinator = Mockito.mock(WorkerNode.class);
         when(nonCoordinator.getMyId()).thenReturn(2);
@@ -245,12 +285,46 @@ class JobGrpcServiceImplTest {
         return updates;
     }
 
+    private JobProgressUpdate lastProgress(String jobId) {
+        List<JobProgressUpdate> updates = readProgress(jobId);
+        return updates.get(updates.size() - 1);
+    }
+
     private static SubmitJobRequest jobRequest(String type, int start, int end) {
         return SubmitJobRequest.newBuilder()
                 .setJobType(type)
                 .putParameters("start", Integer.toString(start))
                 .putParameters("end", Integer.toString(end))
                 .build();
+    }
+
+    private static SubmitJobRequest valueJobRequest(String type, long... values) {
+        SubmitJobRequest.Builder request = SubmitJobRequest.newBuilder().setJobType(type);
+        for (long value : values) {
+            request.addValues(value);
+        }
+        return request.build();
+    }
+
+    private static cs324.assignment2.grpc.ExecuteJobRequest workerRequest(
+            String type, long... values) {
+        cs324.assignment2.grpc.ExecuteJobRequest.Builder request =
+                cs324.assignment2.grpc.ExecuteJobRequest.newBuilder().setJobType(type);
+        for (long value : values) {
+            request.addValues(value);
+        }
+        return request.build();
+    }
+
+    private static ExecuteJobProgress lastWorkerProgress(
+            WorkerServiceGrpc.WorkerServiceBlockingStub workerStub,
+            cs324.assignment2.grpc.ExecuteJobRequest request) {
+        Iterator<ExecuteJobProgress> stream = workerStub.executeJobWithProgress(request);
+        ExecuteJobProgress latest = null;
+        while (stream.hasNext()) {
+            latest = stream.next();
+        }
+        return latest;
     }
 
     private static WorkerInfo workerInfo(int id, Server server) {
@@ -312,17 +386,17 @@ class JobGrpcServiceImplTest {
             responseObserver.onNext(ExecuteJobProgress.newBuilder()
                     .setTaskId(request.getTaskId())
                     .setCompletionPercentage(50.0)
-                    .setResult(0L)
+                    .setResult(calculate(request))
                     .build());
             responseObserver.onNext(ExecuteJobProgress.newBuilder()
                     .setTaskId(request.getTaskId())
                     .setCompletionPercentage(75.0)
-                    .setResult(0L)
+                    .setResult(calculate(request))
                     .build());
             responseObserver.onNext(ExecuteJobProgress.newBuilder()
                     .setTaskId(request.getTaskId())
                     .setCompletionPercentage(100.0)
-                    .setResult(sum(request.getStart(), request.getEnd()))
+                    .setResult(calculate(request))
                     .setIsFinished(true)
                     .build());
             responseObserver.onCompleted();
@@ -346,6 +420,47 @@ class JobGrpcServiceImplTest {
                 total = Math.addExact(total, value);
             }
             return total;
+        }
+
+        private static long calculate(ExecuteJobRequest request) {
+            if (request.getValuesCount() == 0) {
+                if ("MAX".equalsIgnoreCase(request.getJobType())) {
+                    return request.getStart() <= request.getEnd()
+                            ? request.getEnd() : Long.MIN_VALUE;
+                }
+                if ("PRIMECOUNT".equalsIgnoreCase(request.getJobType())) {
+                    long count = 0;
+                    for (long value = request.getStart(); value <= request.getEnd(); value++) {
+                        if (isPrime(value)) {
+                            count++;
+                        }
+                    }
+                    return count;
+                }
+                return sum(request.getStart(), request.getEnd());
+            }
+            if ("MAX".equalsIgnoreCase(request.getJobType())) {
+                return request.getValuesList().stream().mapToLong(Long::longValue).max()
+                        .orElseThrow();
+            }
+            if ("PRIMECOUNT".equalsIgnoreCase(request.getJobType())) {
+                return request.getValuesList().stream()
+                        .filter(ProgressWorker::isPrime)
+                        .count();
+            }
+            return request.getValuesList().stream().mapToLong(Long::longValue).sum();
+        }
+
+        private static boolean isPrime(long value) {
+            if (value < 2) {
+                return false;
+            }
+            for (long divisor = 2; divisor <= value / divisor; divisor++) {
+                if (value % divisor == 0) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 }

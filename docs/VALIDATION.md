@@ -4,10 +4,10 @@ Validation completed on 18 October 2026 using JDK 24 and Maven 3.9.11.
 
 ## Build and service integration tests
 
-Command: `mvnw.cmd -f cs324-A2/pom.xml clean verify`.
-The worker-owned election build passed. `IntegratedClusterTest` ran 13 tests and
-`JobGrpcServiceImplTest` ran 5 tests: 18 total, zero failures, errors or skipped
-tests. The integration tests run actual localhost gRPC bootstrap and worker
+Command: `mvnw.cmd clean verify` (root reactor, Java 24).
+The worker-owned election build passed. `IntegratedClusterTest` ran 14 tests, `JobGrpcServiceImplTest` ran 7 tests and
+`CsvJobLoaderTest` ran 3 tests: 24 integrated-application tests. The standalone
+`election/` module adds 6 tests: 30 total, zero failures, errors or skipped tests. The integration tests run actual localhost gRPC bootstrap and worker
 servers; they do not replace bootstrap discovery with a static membership stub.
 
 1. Registration/discovery and neighbour links; lowest JAC and highest-ID tie-break.
@@ -37,9 +37,16 @@ servers; they do not replace bootstrap discovery with a static membership stub.
 13. Concurrent election triggers at all workers produce one new epoch; every worker
     rejects a stale recovered-view vote after that round completes.
 
-The five job-service tests cover numerical submission/progress, rejection by a
+14. Concurrent MAX and PRIMECOUNT list jobs execute on real worker gRPC servers.
+    Negative-only MAX produces -3; duplicate prime occurrences produce a count of 6.
+    After the coordinator crashes, the same request IDs recover the same results;
+    original list order, duplicates and partition inputs remain in replicated state.
+
+The seven job-service tests cover numerical submission/progress, rejection by a
 non-coordinator, monotonic measured progress during normal execution, failed-worker
-task reassignment, and request-ID deduplication/rejection of changed inputs.
+task reassignment, list MAX/PRIMECOUNT and request-ID deduplication/rejection of
+changed inputs. Three CSV tests cover range/list parsing, duplicate retention,
+quoted comma-separated values and invalid-row rejection.
 
 ## Independent process demonstration
 
@@ -57,11 +64,18 @@ force-kills the coordinator after the client observes completed tasks. The clien
 must rediscover the replacement and finish with the exact PRIMESUM result; an
 already-completed job before crash injection is rejected as an invalid demo.
 
-The latest process logs are in `.demo/integrated-8b47ba9fc6cd46e3b6646901906f8c41/`.
+The latest process logs are in `.demo/integrated-6f664d0c6bef40938a34c3259b2b06d8/`.
 
 The job service, measured streaming, checkpoint recovery and client reconnect
-path are integrated. CSV loading/samples, MAX and PRIMECOUNT list jobs, and multiple
-concurrent jobs inside one GUI remain incomplete. The Swing layout has not been
-visually exercised by this test suite; GUI use shares the tested client logic.
+path are integrated with PR #4 (fcfa3bb): CSV loading/sample_jobs.csv, MAX and
+PRIMECOUNT list jobs, and multiple concurrent GUI progress rows. Each GUI job uses
+the tested reconnecting client. The Swing layout has not been visually exercised
+by this test suite.
 The earlier Word report describes the standalone module; its protocol/state details
 must be updated to this integrated version before the final report is assembled.
+
+The standalone initiator-crash test now observes the injected round at a survivor
+and waits for its replacement round before asserting readiness. This prevents an
+old ready state from satisfying the assertion before the injected election arrives.
+The integrated module passed `clean verify`; after this test synchronization fix,
+the standalone module was revalidated with `mvnw.cmd -pl election -am verify`.
