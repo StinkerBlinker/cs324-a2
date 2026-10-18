@@ -1,7 +1,7 @@
 # CS324 Assignment 2
 
-This branch integrates Joshua's bootstrap and neighbour networking with Pranay's
-leader election and coordinator checkpoint recovery inside `cs324-A2`.
+This branch integrates Joshua's bootstrap/networking, Pranay's leader election
+and recovery, and Aveshal's job execution/streaming/GUI inside `cs324-A2`.
 The original Assignment 1 ZIP/report remain at the repository root.
 
 ## Build
@@ -77,6 +77,8 @@ Automated separate-process demo:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Smoke-Test-Integrated.ps1
+ # Add -RealJob to kill the coordinator during a real PRIMESUM computation.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\Smoke-Test-Integrated.ps1 -RealJob
 ```
 
 It starts bootstrap and three workers, saves a checkpoint, force-kills the leader,
@@ -87,21 +89,45 @@ It stops only the processes it started and leaves logs under `.demo/`.
 
 * `BootstrapServiceImpl`: registration, monotonic heartbeat timeouts and consistent
   election/configuration metadata. It neither reports candidacy nor selects a winner.
-* `WorkerNode`: one gRPC server for networking, election, recovery and later jobs;
+* `WorkerNode`: one gRPC server for networking, election, recovery and job execution;
   pooled channels, deadlines and shutdown cleanup.
 * `ElectionRecovery`: duplicate-suppressed flooding, complete candidate collection,
   JAC selection, coordinator checks, replica recovery and job admission deduplication.
 * `IntegratedClusterTest`: actual localhost gRPC tests using real bootstrap/workers.
 * `docs/INTEGRATION.md`: contracts for Aveshal and the exact recovery assumptions.
 
-Aveshal's `ExecuteJob` and `SubmitJob` methods deliberately return `UNIMPLEMENTED`
-until the job engine is integrated; they no longer return a fake zero/100% result.
-The current GUI is Joshua's starting version and cannot execute jobs yet. Numerical
-work, streaming progress, CSV samples and task reassignment remain pending.
+## Run jobs and the GUI
+
+After starting bootstrap and at least three workers, launch the client:
+
+```powershell
+java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.client.ClientGUI
+```
+
+The GUI submits range jobs and displays measured streamed progress; click the
+progress bar or the details button for the worker breakdown. It automatically
+rediscovers the coordinator and reconnects using the same job ID after failover.
+For a command-line computation with the same reconnect behaviour:
+
+```powershell
+java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.ClusterDemo job localhost 50051 PRIMESUM 1 50 demo-primes
+```
+
+Expected result: 328. Reusing `demo-primes` retrieves that same logical job; use
+a different ID for a different submission. Do not reuse IDs with different inputs.
+Admission, task assignment/completion and failure transitions are checkpointed.
+On failover completed task results are retained; unfinished tasks restart with new
+attempt identities. Partial in-flight progress can decrease when work is retried.
+
+Aveshal's job service currently supports range-based SUM and PRIMESUM. The required
+MAX and PRIMECOUNT over unsorted lists, sample CSV/loading, and multiple concurrent
+jobs in one GUI still need work. The GUI presently monitors one job at a time;
+separate clients and backend jobs can execute concurrently. The old WorkerService
+SubmitJob RPC is deprecated/UNIMPLEMENTED; use the JobService API used by the GUI.
 
 Bootstrap must remain available and retain its metadata. Full-cluster/bootstrap
 restart recovery, TLS/authentication and replicated bootstrap are not implemented.
 Checkpoint bytes are kept in worker RAM. Recovery deliberately stops if a majority
 of the PREVIOUS replica set is unavailable; shrinking the live registry does not
 make loss of acknowledged work acceptable. Do not claim arbitrary partition-safe
-consensus or a completed end-to-end job demonstration.
+consensus. End-to-end job recovery is verified under the documented crash model.

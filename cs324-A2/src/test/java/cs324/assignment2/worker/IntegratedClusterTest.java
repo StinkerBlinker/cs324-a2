@@ -128,14 +128,13 @@ class IntegratedClusterTest {
         StatusRuntimeException failure = assertThrows(StatusRuntimeException.class, () -> save(leader, "unsafe", false));
         assertEquals(Status.Code.FAILED_PRECONDITION, failure.getStatus().getCode());
     }
-    @Test void rejectsOldEpochMessagesAndReportsJobsAsUnimplemented() throws Exception {
+    @Test void rejectsOldEpochMessagesAndExecutesRangeTasks() throws Exception {
         WorkerNode worker = add(0); ready(1, 1);
         var client = stub(worker);
         long epoch = view().getEpoch();
         client.receiveCoordinatorMessage(CoordinatorMessage.newBuilder().setEpoch(epoch - 1).setElectionId("old").setCoordinator(worker.selfInfo()).build());
         assertEquals(epoch, client.getWorkerStatus(GetWorkerStatusRequest.getDefaultInstance()).getEpoch());
-        assertEquals(Status.Code.UNIMPLEMENTED, assertThrows(StatusRuntimeException.class,
-                () -> client.executeJob(ExecuteJobRequest.getDefaultInstance())).getStatus().getCode());
+        assertEquals(55, client.executeJob(ExecuteJobRequest.newBuilder().setJobType("SUM").setStart(1).setEnd(10).build()).getResult());
     }
     @Test void bootstrapLossStopsCoordinatorAdmission() throws Exception {
         WorkerNode worker = add(0); ready(1, 1);
@@ -151,5 +150,47 @@ class IntegratedClusterTest {
         worker.recordRemoteAssignment("job/task/attempt-2");
         assertEquals(2, worker.getJac().get());
         assertEquals(0, stub(worker).getWorkerStatus(GetWorkerStatusRequest.getDefaultInstance()).getJobsThisTerm());
+    }
+    @Test void realPrimeJobResumesAfterCoordinatorCrashWithoutLosingCompletedTasks() throws Exception {
+        add(0); add(0); WorkerNode oldLeader = add(0); ready(3, 3);
+        ManagedChannel oldChannel = ManagedChannelBuilder.forAddress("localhost", oldLeader.selfInfo().getPort()).usePlaintext().build();
+        clients.add(oldChannel);
+        var request = cs324.assignment2.job.grpc.SubmitJobRequest.newBuilder().setJobType("PRIMESUM")
+                .setRequestId("recover-real-primes").putParameters("start", "1").putParameters("end", "2000000").build();
+        var accepted = cs324.assignment2.job.grpc.JobServiceGrpc.newBlockingStub(oldChannel).withDeadlineAfter(8, TimeUnit.SECONDS).submitJob(request);
+        var killed = new java.util.concurrent.atomic.AtomicBoolean();
+        var completedIds = java.util.concurrent.ConcurrentHashMap.<String>newKeySet();
+        cs324.assignment2.job.grpc.JobServiceGrpc.newStub(oldChannel).withDeadlineAfter(20, TimeUnit.SECONDS)
+                .streamJobProgress(cs324.assignment2.job.grpc.StreamJobProgressRequest.newBuilder().setJobId(accepted.getJobId()).build(),
+                        new io.grpc.stub.StreamObserver<cs324.assignment2.job.grpc.JobProgressUpdate>() {
+                            @Override public void onNext(cs324.assignment2.job.grpc.JobProgressUpdate update) {
+                                var done = update.getSubTasksList().stream().filter(t -> t.getState() == cs324.assignment2.job.grpc.SubTaskState.SUB_TASK_STATE_COMPLETED).toList();
+                                if (!done.isEmpty() && update.getStatus() != cs324.assignment2.job.grpc.JobStatus.JOB_STATUS_COMPLETED && killed.compareAndSet(false, true)) {
+                                    done.forEach(t -> completedIds.add(t.getSubTaskId()));
+                                    new Thread(oldLeader::crash).start();
+                                }
+                            }
+                            @Override public void onError(Throwable error) { }
+                            @Override public void onCompleted() { }
+                        });
+        await(killed::get); ready(2, 2);
+        WorkerNode replacement = workers.get(1);
+        ManagedChannel nextChannel = ManagedChannelBuilder.forAddress("localhost", replacement.selfInfo().getPort()).usePlaintext().build();
+        clients.add(nextChannel);
+        var next = cs324.assignment2.job.grpc.JobServiceGrpc.newBlockingStub(nextChannel);
+        var resumed = next.withDeadlineAfter(8, TimeUnit.SECONDS).submitJob(request);
+        assertEquals(accepted.getJobId(), resumed.getJobId());
+        var progress = next.withDeadlineAfter(25, TimeUnit.SECONDS).streamJobProgress(
+                cs324.assignment2.job.grpc.StreamJobProgressRequest.newBuilder().setJobId(accepted.getJobId()).build());
+        cs324.assignment2.job.grpc.JobProgressUpdate terminal = null;
+        while (progress.hasNext()) terminal = progress.next();
+        assertNotNull(terminal);
+        assertEquals(cs324.assignment2.job.grpc.JobStatus.JOB_STATUS_COMPLETED, terminal.getStatus());
+        assertEquals(142913828922L, terminal.getResult());
+        var record = read(replacement).getRecordsList().stream().filter(r -> r.getKey().equals("job/" + accepted.getJobId())).findFirst().orElseThrow();
+        var saved = cs324.assignment2.job.grpc.PersistedJob.parseFrom(record.getPayload());
+        assertTrue(saved.getTasksList().stream().filter(t -> t.getState() == cs324.assignment2.job.grpc.SubTaskState.SUB_TASK_STATE_COMPLETED)
+                .map(t -> t.getRequest().getTaskId()).collect(java.util.stream.Collectors.toSet()).containsAll(completedIds));
+        assertEquals(0, stub(replacement).getWorkerStatus(GetWorkerStatusRequest.getDefaultInstance()).getJobsThisTerm());
     }
 }

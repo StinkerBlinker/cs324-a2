@@ -1,3 +1,4 @@
+param([switch]$RealJob)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $demoJar = Join-Path $projectRoot 'cs324-A2\target\cs324-A2-1.0-SNAPSHOT.jar'
@@ -31,6 +32,9 @@ function Start-ClusterProcess([string]$name, [string]$className, [string[]]$prog
         -RedirectStandardOutput (Join-Path $demoLogDir "$name.out.log") `
         -RedirectStandardError (Join-Path $demoLogDir "$name.err.log")
     $processes.Add($process)
+    # Cache the process handle before exit; Windows PowerShell can otherwise
+    # expose a null ExitCode even after WaitForExit reports success.
+    $null = $process.Handle
     return $process
 }
 function Start-Worker([string]$name) {
@@ -72,8 +76,27 @@ try {
     Wait-Ready 3 3
     $saved = Invoke-Cluster -clientArgs @('checkpoint', 'localhost', "$bootstrapPort", 'demo-job', 'demo-only;task-A=done;task-B=pending')
     if ($script:clientExitCode -ne 0 -or ($saved -join '') -notmatch 'CHECKPOINT_ACCEPTED=true') { throw 'Checkpoint replication failed' }
+    $realJobProcess = $null
+    if ($RealJob) {
+        $realJobProcess = Start-ClusterProcess -name 'real-job' -className 'cs324.assignment2.worker.ClusterDemo' `
+            -programArgs @('job', 'localhost', "$bootstrapPort", 'PRIMESUM', '1', '2000000', 'process-primes')
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            $jobLog = Get-Content -LiteralPath (Join-Path $demoLogDir 'real-job.out.log') -Raw -ErrorAction SilentlyContinue
+            if ($jobLog -match 'JOB_RESULT=') { throw 'Job finished before crash injection; no mid-job recovery was tested' }
+            if ($jobLog -match 'JOB_TASKS_DONE=[1-9][0-9]*') { break }
+            if ($realJobProcess.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw "Real job did not produce partial results; see $demoLogDir" }
+            Start-Sleep -Milliseconds 20
+        } while ($true)
+    }
     Stop-Process -Id $workerProcesses[3].Id -Force
     Wait-Ready 2 2
+    if ($RealJob) {
+        if (-not $realJobProcess.WaitForExit(60000)) { throw 'Real job did not finish after coordinator replacement' }
+        $jobLog = Get-Content -LiteralPath (Join-Path $demoLogDir 'real-job.out.log') -Raw
+        if (($null -ne $realJobProcess.ExitCode -and $realJobProcess.ExitCode -ne 0) -or $jobLog -notmatch 'JOB_RESULT=142913828922') { throw "Wrong recovered numerical result; see $demoLogDir" }
+        Write-Output 'PASS: PRIMESUM resumed after a coordinator JVM kill, client reconnected, exact result 142913828922.'
+    }
     $recovered = Invoke-Cluster -clientArgs @('read', 'localhost', "$bootstrapPort")
     if ($script:clientExitCode -ne 0 -or ($recovered -join '') -notmatch 'demo-job = demo-only;task-A=done;task-B=pending') { throw 'Recovery after coordinator crash failed' }
     Write-Output 'PASS: real bootstrap registration, coordinator crash detection, replacement election and checkpoint recovery.'

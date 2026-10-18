@@ -5,9 +5,10 @@ Validation completed on 18 October 2026 using JDK 24 and Maven 3.9.11.
 ## Build and service integration tests
 
 Command: `mvnw.cmd -f cs324-A2/pom.xml clean verify`.
-The packaged build passed. `IntegratedClusterTest` ran 10 tests with zero failures,
-zero errors and zero skipped tests. Tests run actual localhost gRPC bootstrap and
-worker servers; they do not replace bootstrap discovery with a static membership stub.
+The packaged build passed. `IntegratedClusterTest` ran 11 tests and
+`JobGrpcServiceImplTest` ran 5 tests: 16 total, zero failures, errors or skipped
+tests. The integration tests run actual localhost gRPC bootstrap and worker
+servers; they do not replace bootstrap discovery with a static membership stub.
 
 1. Registration/discovery and neighbour links; lowest JAC and highest-ID tie-break.
 2. Abrupt coordinator loss; heartbeat expiry, replacement election and checkpoint recovery.
@@ -20,12 +21,20 @@ worker servers; they do not replace bootstrap discovery with a static membership
 6. Election initiator loss; retry and overlay repair let remaining workers agree.
 7. Previous replica majority loss; the remaining worker refuses to start an empty
    replacement or acknowledge an unsafe checkpoint.
-8. Older coordinator messages do not roll back the epoch; unfinished job execution
-   RPCs return UNIMPLEMENTED instead of reporting fabricated results.
+8. Older coordinator messages do not roll back the epoch; worker range execution
+   returns its actual computed result.
 9. Bootstrap loss; the coordinator stops advertising readiness and cannot admit
    new checkpoints without authoritative metadata.
 10. Actual-allocation accounting deduplicates the same job/task/attempt ID while
     counting a distinct reassignment separately from the five-job term counter.
+11. A real PRIMESUM job is interrupted after completed subtasks have been
+    checkpointed. The coordinator crashes, the replacement recovers those task
+    results and resumes the same job ID. PRIMESUM(1,2000000) returns 142913828922;
+    acknowledged completed task identities remain in the recovered final state.
+
+The five job-service tests cover numerical submission/progress, rejection by a
+non-coordinator, monotonic measured progress during normal execution, failed-worker
+task reassignment, and request-ID deduplication/rejection of changed inputs.
 
 ## Independent process demonstration
 
@@ -38,8 +47,14 @@ read back. A fourth worker then registered into the still-running cluster, becam
 coordinator and recovered the existing checkpoint through the configuration change.
 Both smoke-test checks passed. The script stopped its own remaining processes.
 
-These tests prove election, discovery and checkpoint integration. They do not prove
-completion/resumption of an actual numerical job, task reassignment, CSV loading,
-GUI progress or stream reconnection: those require Aveshal's pending job component.
+With `-RealJob`, the process demo additionally starts a reconnecting client and
+force-kills the coordinator after the client observes completed tasks. The client
+must rediscover the replacement and finish with the exact PRIMESUM result; an
+already-completed job before crash injection is rejected as an invalid demo.
+
+The job service, measured streaming, checkpoint recovery and client reconnect
+path are integrated. CSV loading/samples, MAX and PRIMECOUNT list jobs, and multiple
+concurrent jobs inside one GUI remain incomplete. The Swing layout has not been
+visually exercised by this test suite; GUI use shares the tested client logic.
 The earlier Word report describes the standalone module; its protocol/state details
 must be updated to this integrated version before the final report is assembled.

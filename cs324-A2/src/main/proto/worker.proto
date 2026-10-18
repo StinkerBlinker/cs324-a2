@@ -26,6 +26,7 @@ service WorkerService {
 
   // Job execution (Aveshal)
   rpc ExecuteJob (ExecuteJobRequest) returns (ExecuteJobResponse);
+  rpc ExecuteJobWithProgress (ExecuteJobRequest) returns (stream ExecuteJobProgress);
   rpc SubmitJob (SubmitJobRequest) returns (stream JobProgressUpdate);
 }
 
@@ -75,11 +76,21 @@ message ExecuteJobRequest {
   int32  start    = 2;
   int32  end      = 3;
   string task_id  = 4;
+  map<string, string> parameters = 5;
+  bytes payload = 6;
 }
 
 message ExecuteJobResponse {
   int64 result = 1;
   string task_id = 2;
+}
+
+message ExecuteJobProgress {
+  string task_id = 1;
+  double completion_percentage = 2;
+  int64 result = 3;
+  bool is_finished = 4;
+  string error_message = 5;
 }
 
 message SubmitJobRequest {

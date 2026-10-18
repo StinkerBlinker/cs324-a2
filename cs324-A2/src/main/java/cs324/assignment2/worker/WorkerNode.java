@@ -26,6 +26,8 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
     private ManagedChannel bootstrapChannel;
     private Server server;
     private volatile ElectionRecovery election;
+    private final JobGrpcServiceImpl jobGrpcService = new JobGrpcServiceImpl(this);
+    private final ExecutorService jobPool = Executors.newCachedThreadPool();
 
     public WorkerNode() { this("localhost", 50051, 0, 0); }
     public WorkerNode(String bootstrapHost, int bootstrapPort, int listenPort, int initialJac) {
@@ -50,7 +52,7 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
     public void start() throws Exception {
         try {
             bootstrapChannel = ManagedChannelBuilder.forAddress(bootstrapHost, bootstrapPort).usePlaintext().build();
-            server = ServerBuilder.forPort(requestedPort).addService(this).build().start();
+            server = ServerBuilder.forPort(requestedPort).addService(this).addService(jobGrpcService).build().start();
             port = server.getPort();
             id = bootstrap().registerWorker(RegisterWorkerRequest.newBuilder().setHost("localhost").setPort(port).build()).getWorkerId();
             election = new ElectionRecovery(this);
@@ -58,7 +60,7 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
             scheduler.scheduleWithFixedDelay(this::sendHeartbeat, 0, heartbeatMs, TimeUnit.MILLISECONDS);
             joinNetwork();
             scheduler.scheduleWithFixedDelay(() -> {
-                try { if (!stopped && !registrationLost) election.tick(); }
+                try { if (!stopped && !registrationLost) { election.tick(); jobGrpcService.refreshLeadership(); } }
                 catch (Exception e) { election.unavailable(); log("monitor: " + e.getMessage()); }
             }, 100, monitorMs, TimeUnit.MILLISECONDS);
         } catch (Exception failure) { close(); throw failure; }
@@ -159,8 +161,10 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
         respond(out, () -> controller().replicate(req));
     }
     @Override public void executeJob(ExecuteJobRequest req, StreamObserver<ExecuteJobResponse> out) {
-        // Aveshal's integration hook: never report a fabricated successful result.
-        out.onError(Status.UNIMPLEMENTED.withDescription("Job execution awaits job-engine integration").asRuntimeException());
+        jobPool.execute(() -> TaskExecution.execute(req, out));
+    }
+    @Override public void executeJobWithProgress(ExecuteJobRequest req, StreamObserver<ExecuteJobProgress> out) {
+        jobPool.execute(() -> TaskExecution.stream(req, out));
     }
     @Override public void submitJob(SubmitJobRequest req, StreamObserver<JobProgressUpdate> out) {
         out.onError(Status.UNIMPLEMENTED.withDescription("Job submission/progress awaits job-engine integration").asRuntimeException());
@@ -175,6 +179,8 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
     public List<WorkerInfo> getActiveWorkersFromBootstrap() {
         return bootstrap().getActiveWorkers(GetActiveWorkersRequest.getDefaultInstance()).getWorkersList();
     }
+    public boolean isReadyCoordinator() { return election != null && !stopped() && election.status().getReady(); }
+    public long getMyEpoch() { return election == null ? 0 : election.status().getEpoch(); }
     public int getMyId() { return id; }
     public int getMyCoordinatorId() { return controller().coordinatorId(); }
     public List<WorkerInfo> getNeighbours() { return neighbours; }
@@ -191,6 +197,7 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
         if (deregister && id > 0) try { bootstrap().deregisterWorker(DeregisterWorkerRequest.newBuilder().setWorkerId(id).build()); }
         catch (StatusRuntimeException ignored) { }
         if (server != null) server.shutdownNow();
+        jobGrpcService.close(); jobPool.shutdownNow();
         floodPool.shutdownNow(); channels.values().forEach(ManagedChannel::shutdownNow);
         if (bootstrapChannel != null) bootstrapChannel.shutdownNow();
     }

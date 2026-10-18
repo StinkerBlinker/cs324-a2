@@ -1,16 +1,23 @@
 package cs324.assignment2.client;
 
 import cs324.assignment2.grpc.*;
+import cs324.assignment2.job.grpc.JobProgressUpdate;
+import cs324.assignment2.job.grpc.JobServiceGrpc;
+import cs324.assignment2.job.grpc.JobStatus;
+import cs324.assignment2.job.grpc.StreamJobProgressRequest;
+import cs324.assignment2.job.grpc.SubmitJobRequest;
+import cs324.assignment2.job.grpc.SubmitJobResponse;
+import cs324.assignment2.job.grpc.WorkerStatusMetric;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-import io.grpc.stub.StreamObserver;
+import io.grpc.StatusRuntimeException;
 
 import javax.swing.*;
+import javax.swing.table.DefaultTableModel;
 import java.awt.*;
 import java.util.List;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ExecutionException;
 
 public class ClientGUI extends JFrame {
 
@@ -20,9 +27,22 @@ public class ClientGUI extends JFrame {
     private final JTextField jobTypeField = new JTextField("PRIMESUM", 10);
     private final JTextField startField   = new JTextField("1", 6);
     private final JTextField endField     = new JTextField("50", 6);
-    private final JProgressBar progressBar = new JProgressBar(0, 100);
+    private final JProgressBar progressBar = new JProgressBar(0, 1000);
     private final JTextArea logArea = new JTextArea(12, 50);
-    private final JLabel resultLabel = new JLabel("Result: —");
+    private final JLabel resultLabel = new JLabel("Result: â€”");
+    private final JButton submitButton = new JButton("Submit Job");
+    private final JButton detailsButton = new JButton("Show worker details");
+    private final JPanel detailsPanel = new JPanel(new BorderLayout());
+    private final DefaultTableModel workerTableModel = new DefaultTableModel(
+            new Object[]{"Worker ID", "Status", "Progress", "Active Tasks",
+                    "Completed Tasks", "Metrics"}, 0) {
+        @Override
+        public boolean isCellEditable(int row, int column) {
+            return false;
+        }
+    };
+    private final JTable workerTable = new JTable(workerTableModel);
+    private SwingWorker<Void, JobProgressUpdate> activeJob;
 
     public ClientGUI() {
         super("CS324 A2 Client");
@@ -36,27 +56,52 @@ public class ClientGUI extends JFrame {
         top.add(startField);
         top.add(new JLabel("End:"));
         top.add(endField);
-        JButton submitBtn = new JButton("Submit Job");
-        top.add(submitBtn);
+        top.add(submitButton);
 
         progressBar.setStringPainted(true);
         progressBar.setValue(0);
+        progressBar.setString("0.0%");
 
         logArea.setEditable(false);
         JScrollPane scroll = new JScrollPane(logArea);
 
-        add(top, BorderLayout.NORTH);
-        add(progressBar, BorderLayout.CENTER);
-        add(scroll, BorderLayout.SOUTH);
-        add(resultLabel, BorderLayout.EAST);
+        JPanel progressPanel = new JPanel(new BorderLayout(8, 4));
+        progressPanel.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
+        progressPanel.add(progressBar, BorderLayout.CENTER);
+        progressPanel.add(resultLabel, BorderLayout.EAST);
 
-        submitBtn.addActionListener(e -> submitJob());
+        workerTable.setFillsViewportHeight(true);
+        detailsPanel.add(new JScrollPane(workerTable), BorderLayout.CENTER);
+        detailsPanel.setPreferredSize(new Dimension(600, 170));
+        detailsPanel.setVisible(false);
+
+        JPanel content = new JPanel(new BorderLayout(8, 8));
+        content.add(progressPanel, BorderLayout.NORTH);
+        content.add(scroll, BorderLayout.CENTER);
+        content.add(detailsPanel, BorderLayout.SOUTH);
+
+        JPanel footer = new JPanel(new BorderLayout());
+        footer.add(detailsButton, BorderLayout.WEST);
+
+        add(top, BorderLayout.NORTH);
+        add(content, BorderLayout.CENTER);
+        add(footer, BorderLayout.SOUTH);
+
+        submitButton.addActionListener(e -> submitJob());
+        detailsButton.addActionListener(e -> toggleWorkerDetails());
+        progressBar.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent event) { toggleWorkerDetails(); }
+        });
 
         pack();
         setLocationRelativeTo(null);
     }
 
     private void submitJob() {
+        if (activeJob != null && !activeJob.isDone()) {
+            return;
+        }
+
         String jobType = jobTypeField.getText().trim().toUpperCase();
         int start, end;
         try {
@@ -68,117 +113,131 @@ public class ClientGUI extends JFrame {
         }
 
         progressBar.setValue(0);
-        resultLabel.setText("Result: —");
+        progressBar.setString("0.0%");
+        resultLabel.setText("Result: â€”");
+        workerTableModel.setRowCount(0);
         log("Looking up coordinator via Bootstrap...");
 
-        new Thread(() -> {
-            try {
-                ManagedChannel bootstrapCh = ManagedChannelBuilder
-                        .forAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT)
-                        .usePlaintext()
-                        .build();
-                BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap =
-                        BootstrapServiceGrpc.newBlockingStub(bootstrapCh);
-
-                List<WorkerInfo> workers = bootstrap.getActiveWorkers(
-                        GetActiveWorkersRequest.newBuilder().build()).getWorkersList();
-                bootstrapCh.shutdown();
-
-                if (workers.isEmpty()) {
-                    log("No active workers found.");
-                    return;
-                }
-
-                int coordinatorId = -1;
-                WorkerInfo coordinatorInfo = null;
-                for (WorkerInfo w : workers) {
-                    try {
-                        ManagedChannel ch = ManagedChannelBuilder
-                                .forAddress(w.getHost(), w.getPort())
-                                .usePlaintext()
-                                .build();
-                        WorkerServiceGrpc.WorkerServiceBlockingStub stub =
-                                WorkerServiceGrpc.newBlockingStub(ch);
-                        int cid = stub.getCoordinatorId(
-                                GetCoordinatorIdRequest.newBuilder().build()).getCoordinatorId();
-                        ch.shutdown();
-                        if (cid != -1) {
-                            coordinatorId = cid;
-                            for (WorkerInfo cand : workers) {
-                                if (cand.getId() == cid) {
-                                    coordinatorInfo = cand;
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                    } catch (Exception ignored) {}
-                }
-
-                if (coordinatorInfo == null) {
-                    coordinatorInfo = workers.get(0);
-                    log("No coordinator announced yet — sending to Worker "
-                            + coordinatorInfo.getId());
-                } else {
-                    log("Coordinator is Worker " + coordinatorId);
-                }
-
-                ManagedChannel jobCh = ManagedChannelBuilder
-                        .forAddress(coordinatorInfo.getHost(), coordinatorInfo.getPort())
-                        .usePlaintext()
-                        .build();
-                WorkerServiceGrpc.WorkerServiceStub asyncStub =
-                        WorkerServiceGrpc.newStub(jobCh);
-
-                CountDownLatch latch = new CountDownLatch(1);
-
-                asyncStub.submitJob(
-                        SubmitJobRequest.newBuilder()
-                                .setJobType(jobType)
-                                .setStart(start)
-                                .setEnd(end)
-                                .build(),
-                        new StreamObserver<JobProgressUpdate>() {
-                            @Override
-                            public void onNext(JobProgressUpdate update) {
-                                SwingUtilities.invokeLater(() -> {
-                                    progressBar.setValue((int) update.getOverallPercent());
-                                    if (update.getIsFinished()) {
-                                        resultLabel.setText("Result: " + update.getFinalResult());
-                                    }
-                                    if (!update.getWorkersList().isEmpty()) {
-                                        StringBuilder sb = new StringBuilder("Workers: ");
-                                        for (WorkerProgress wp : update.getWorkersList()) {
-                                            sb.append("[W").append(wp.getWorkerId())
-                                              .append(" ").append(String.format("%.0f", wp.getPercentDone()))
-                                              .append("% ").append(wp.getStatus()).append("] ");
-                                        }
-                                        log(sb.toString());
-                                    }
-                                });
-                            }
-
-                            @Override
-                            public void onError(Throwable t) {
-                                log("Job failed: " + t.getMessage());
-                                latch.countDown();
-                            }
-
-                            @Override
-                            public void onCompleted() {
-                                log("Job stream completed.");
-                                latch.countDown();
-                            }
-                        });
-
-                latch.await(120, TimeUnit.SECONDS);
-                jobCh.shutdown();
-
-            } catch (Exception e) {
-                log("Error: " + e.getMessage());
-                e.printStackTrace();
+        submitButton.setEnabled(false);
+        activeJob = new SwingWorker<>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                String requestId = java.util.UUID.randomUUID().toString();
+                publishStatus("Tracking job " + requestId + "; reconnecting automatically after coordinator changes");
+                ResilientJobClient.run(BOOTSTRAP_HOST, BOOTSTRAP_PORT,
+                        SubmitJobRequest.newBuilder().setRequestId(requestId).setJobType(jobType)
+                                .putParameters("start", Integer.toString(start))
+                                .putParameters("end", Integer.toString(end)).build(),
+                        update -> publish(update), TimeUnit.MINUTES.toMillis(10));
+                return null;
             }
-        }, "client-submit").start();
+
+            @Override
+            protected void process(List<JobProgressUpdate> updates) {
+                for (JobProgressUpdate update : updates) {
+                    showProgress(update);
+                }
+            }
+
+            @Override
+            protected void done() {
+                submitButton.setEnabled(true);
+                try {
+                    get();
+                    log("Job progress stream ended.");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log("Job monitoring was interrupted.");
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    log("Job monitoring failed: "
+                            + (cause == null ? e.getMessage() : cause.getMessage()));
+                }
+            }
+        };
+        activeJob.execute();
+    }
+
+    private WorkerInfo findCoordinator(List<WorkerInfo> workers) {
+        for (WorkerInfo worker : workers) {
+            ManagedChannel channel = ManagedChannelBuilder
+                    .forAddress(worker.getHost(), worker.getPort())
+                    .usePlaintext()
+                    .build();
+            try {
+                int coordinatorId = WorkerServiceGrpc.newBlockingStub(channel)
+                        .withDeadlineAfter(2, TimeUnit.SECONDS)
+                        .getCoordinatorId(GetCoordinatorIdRequest.newBuilder().build())
+                        .getCoordinatorId();
+                for (WorkerInfo candidate : workers) {
+                    if (candidate.getId() == coordinatorId) {
+                        log("Coordinator is Worker " + coordinatorId);
+                        return candidate;
+                    }
+                }
+            } catch (StatusRuntimeException e) {
+                log("Could not query Worker " + worker.getId()
+                        + " for coordinator status: " + e.getStatus().getDescription());
+            } finally {
+                shutdownChannel(channel);
+            }
+        }
+
+        WorkerInfo fallback = workers.get(0);
+        log("No coordinator announced; trying Worker " + fallback.getId());
+        return fallback;
+    }
+
+    private void showProgress(JobProgressUpdate update) {
+        double percentage = Math.max(0.0, Math.min(100.0, update.getCompletionPercentage()));
+        progressBar.setValue((int) Math.round(percentage * 10.0));
+        progressBar.setString(String.format("%.1f%%", percentage));
+        workerTableModel.setRowCount(0);
+        for (WorkerStatusMetric worker : update.getWorkersList()) {
+            workerTableModel.addRow(new Object[]{
+                    worker.getWorkerId(),
+                    worker.getStatus(),
+                    String.format("%.1f%%", worker.getCompletionPercentage()),
+                    worker.getActiveSubTaskCount(),
+                    worker.getCompletedSubTaskCount(),
+                    worker.getStatusMessage()
+            });
+        }
+
+        if (update.getStatus() == JobStatus.JOB_STATUS_COMPLETED) {
+            resultLabel.setText("Result: " + update.getResult());
+        } else if (update.getStatus() == JobStatus.JOB_STATUS_FAILED) {
+            resultLabel.setText("Job failed");
+        } else if (update.getStatus() == JobStatus.JOB_STATUS_CANCELLED) {
+            resultLabel.setText("Job cancelled");
+        }
+        log(String.format("Progress %.1f%% - %s - active workers: %d",
+                percentage, update.getMessage(), update.getActiveWorkerCount()));
+    }
+
+    private void publishStatus(String message) {
+        SwingUtilities.invokeLater(() -> log(message));
+    }
+
+    private void toggleWorkerDetails() {
+        boolean visible = !detailsPanel.isVisible();
+        detailsPanel.setVisible(visible);
+        detailsButton.setText(visible ? "Hide worker details" : "Show worker details");
+        pack();
+    }
+
+    private static void shutdownChannel(ManagedChannel channel) {
+        if (channel != null) {
+            channel.shutdown();
+            try {
+                if (!channel.awaitTermination(1, TimeUnit.SECONDS)) {
+                    channel.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                channel.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private void log(String msg) {

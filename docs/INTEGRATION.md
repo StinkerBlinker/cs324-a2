@@ -51,7 +51,20 @@ records may be recovered; callers must reconcile stable IDs rather than assume
 an unsuccessful response means no record exists. This is not a general consensus
 protocol or a proof of linearizable behaviour during arbitrary partitions.
 
-## Aveshal job engine hook
+## Integrated job engine
+
+JobGrpcServiceImpl is now registered on the same worker server. Its PersistedJob
+protobuf stores original submission, stable job ID, status and each task request,
+attempt counter, worker identity, completion state and accepted result. Records use
+the `job/` key prefix. Other checkpoint fixtures remain opaque to the job engine.
+
+Admission is replicated before acknowledgement. Task assignment, completion and
+failure transitions are checkpointed before publication; partial streamed progress
+does not generate a checkpoint for every percentage update. On a new coordinator,
+completed results are retained and unfinished attempts are rescheduled. Old-owner
+streams close with UNAVAILABLE. ResilientJobClient rediscovers the coordinator and
+resubmits/reconnects with the original request_id, preventing a second logical job.
+Clients must use distinct request IDs for distinct inputs.
 
 `SaveCheckpointRequest` accepts a stable key and opaque bytes. Include the real
 job type/full input, client request ID, task boundaries, assignments/attempt IDs,
@@ -85,9 +98,11 @@ completed job records for request deduplication. No exactly-once task execution 
 provided by the checkpoint layer itself.
 
 Do not block election/heartbeat threads with numerical computation. Use a separate
-executor. The job RPC methods currently return UNIMPLEMENTED instead of fake success.
-The existing range-only job requests still need true list input support for MAX
-and PRIMECOUNT, plus the required CSV demo data and GUI progress breakdown.
+executor. WorkerService execute RPCs now run SUM/PRIMESUM; JobService handles
+submission/progress. The old WorkerService SubmitJob remains UNIMPLEMENTED and
+is not used by the GUI. The range-only jobs still need true list input support
+for MAX and PRIMECOUNT, CSV samples/loading and multiple concurrent GUI job rows.
+Worker details can be opened by clicking the progress bar or its details button.
 
 ## Remaining boundaries
 
@@ -95,5 +110,6 @@ In-memory replica survival covers process loss while enough previous voters and
 bootstrap remain available. Persistent JAC/epoch storage, bootstrap replication,
 full restart recovery and authentication/TLS are not implemented. A worker whose
 registration expires must stop and rejoin with a new ID; it does not silently
-resume using its old identity. Live joins are tested with checkpoint state,
-not yet with real numerical tasks or GUI progress streams.
+resume using its old identity. Live joins are tested with checkpoint state;
+coordinator failover is also tested during a real numerical job with retained
+completed subtasks and correct final aggregation.
