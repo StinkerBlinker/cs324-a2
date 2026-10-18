@@ -250,11 +250,11 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
                            StreamObserver<ExecuteJobResponse> responseObserver) {
         if (!isSupportedJobType(request.getJobType())) {
             responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription("Supported job types are SUM and PRIMESUM")
+                    .withDescription("Supported job types are SUM, PRIMESUM, MAX and PRIMECOUNT")
                     .asRuntimeException());
             return;
         }
-        if (request.getStart() > request.getEnd()) {
+        if (request.getValuesCount() == 0 && request.getStart() > request.getEnd()) {
             responseObserver.onError(Status.INVALID_ARGUMENT
                     .withDescription("start must be less than or equal to end")
                     .asRuntimeException());
@@ -263,8 +263,8 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
 
         jobPool.execute(() -> {
             try {
-                long result = calculateRange(request.getJobType(), request.getStart(),
-                        request.getEnd(), (percentage, partialResult) -> { });
+                long result = calculateJob(request,
+                        (percentage, partialResult) -> { });
                 responseObserver.onNext(ExecuteJobResponse.newBuilder()
                         .setResult(result)
                         .setTaskId(request.getTaskId())
@@ -284,11 +284,11 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
                                        StreamObserver<ExecuteJobProgress> responseObserver) {
         if (!isSupportedJobType(request.getJobType())) {
             responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription("Supported job types are SUM and PRIMESUM")
+                    .withDescription("Supported job types are SUM, PRIMESUM, MAX and PRIMECOUNT")
                     .asRuntimeException());
             return;
         }
-        if (request.getStart() > request.getEnd()) {
+        if (request.getValuesCount() == 0 && request.getStart() > request.getEnd()) {
             responseObserver.onError(Status.INVALID_ARGUMENT
                     .withDescription("start must be less than or equal to end")
                     .asRuntimeException());
@@ -297,7 +297,7 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
 
         jobPool.execute(() -> {
             try {
-                long result = calculateRange(request.getJobType(), request.getStart(), request.getEnd(),
+                long result = calculateJob(request,
                         (percentage, partialResult) -> responseObserver.onNext(
                                 ExecuteJobProgress.newBuilder()
                                         .setTaskId(request.getTaskId())
@@ -321,20 +321,38 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     private static boolean isSupportedJobType(String jobType) {
-        return "SUM".equalsIgnoreCase(jobType) || "PRIMESUM".equalsIgnoreCase(jobType);
+        return "SUM".equalsIgnoreCase(jobType)
+                || "PRIMESUM".equalsIgnoreCase(jobType)
+                || "MAX".equalsIgnoreCase(jobType)
+                || "PRIMECOUNT".equalsIgnoreCase(jobType);
     }
 
-    private static long calculateRange(String jobType, int start, int end,
-                                       JobProgressListener progressListener) {
-        long itemCount = (long) end - start + 1;
+    private static long calculateJob(ExecuteJobRequest request,
+                                     JobProgressListener progressListener) {
+        String jobType = request.getJobType().toUpperCase();
+        List<Long> values = request.getValuesList();
+        long itemCount = values.isEmpty()
+                ? (long) request.getEnd() - request.getStart() + 1
+                : values.size();
         long progressInterval = Math.max(1L,
                 (itemCount + PROGRESS_UPDATE_TARGET - 1) / PROGRESS_UPDATE_TARGET);
-        long result = 0L;
+        long result = "MAX".equals(jobType) ? Long.MIN_VALUE : 0L;
         long completed = 0L;
-        boolean primeSum = "PRIMESUM".equalsIgnoreCase(jobType);
+        boolean primeSum = "PRIMESUM".equals(jobType);
+        boolean primeCount = "PRIMECOUNT".equals(jobType);
+        boolean maximum = "MAX".equals(jobType);
 
-        for (long value = start; value <= end; value++) {
-            if (!primeSum || isPrime(value)) {
+        for (long index = 0; index < itemCount; index++) {
+            long value = values.isEmpty()
+                    ? (long) request.getStart() + index
+                    : values.get(Math.toIntExact(index));
+            if (maximum) {
+                result = Math.max(result, value);
+            } else if (primeCount) {
+                if (isPrime(value)) {
+                    result = Math.addExact(result, 1L);
+                }
+            } else if (!primeSum || isPrime(value)) {
                 result = Math.addExact(result, value);
             }
             completed++;

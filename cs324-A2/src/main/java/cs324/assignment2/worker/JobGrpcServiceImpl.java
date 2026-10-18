@@ -67,29 +67,34 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                     .asRuntimeException());
             return;
         }
-        if (!"SUM".equals(jobType) && !"PRIMESUM".equals(jobType)) {
+        if (!isSupportedJobType(jobType)) {
             responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription("Supported job types are SUM and PRIMESUM")
+                    .withDescription("Supported job types are SUM, PRIMESUM, MAX and PRIMECOUNT")
                     .asRuntimeException());
             return;
         }
 
         int start;
         int end;
-        try {
-            start = Integer.parseInt(request.getParametersMap().getOrDefault("start", ""));
-            end = Integer.parseInt(request.getParametersMap().getOrDefault("end", ""));
-        } catch (NumberFormatException e) {
-            responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription("parameters must include integer start and end values")
-                    .asRuntimeException());
-            return;
-        }
-        if (start > end) {
-            responseObserver.onError(Status.INVALID_ARGUMENT
-                    .withDescription("start must be less than or equal to end")
-                    .asRuntimeException());
-            return;
+        if (request.getValuesCount() == 0) {
+            try {
+                start = Integer.parseInt(request.getParametersMap().getOrDefault("start", ""));
+                end = Integer.parseInt(request.getParametersMap().getOrDefault("end", ""));
+            } catch (NumberFormatException e) {
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                        .withDescription("Provide numeric values or integer start and end parameters")
+                        .asRuntimeException());
+                return;
+            }
+            if (start > end) {
+                responseObserver.onError(Status.INVALID_ARGUMENT
+                        .withDescription("start must be less than or equal to end")
+                        .asRuntimeException());
+                return;
+            }
+        } else {
+            start = 0;
+            end = -1;
         }
 
         List<WorkerInfo> workers;
@@ -116,7 +121,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         List<TaskAssignment> assignments = createAssignments(
                 request, jobType, start, end, workers);
         String jobId = UUID.randomUUID().toString();
-        JobExecution job = new JobExecution(jobId, assignments, workers);
+        JobExecution job = new JobExecution(jobId, jobType, assignments, workers);
         jobs.put(jobId, job);
 
         responseObserver.onNext(SubmitJobResponse.newBuilder()
@@ -130,6 +135,11 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             job.start();
             schedule(job);
         });
+    }
+
+    private static boolean isSupportedJobType(String jobType) {
+        return "SUM".equals(jobType) || "PRIMESUM".equals(jobType)
+                || "MAX".equals(jobType) || "PRIMECOUNT".equals(jobType);
     }
 
     @Override
@@ -147,30 +157,37 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
 
     private List<TaskAssignment> createAssignments(SubmitJobRequest originalRequest, String jobType,
                                                    int start, int end, List<WorkerInfo> workers) {
-        long rangeSize = (long) end - start + 1;
+        boolean hasExplicitValues = originalRequest.getValuesCount() > 0;
+        long rangeSize = hasExplicitValues
+                ? originalRequest.getValuesCount()
+                : (long) end - start + 1;
         long requestedTaskCount = Math.min((long) workers.size() * TASKS_PER_WORKER,
                 MAX_TASK_COUNT);
         int taskCount = (int) Math.min(rangeSize, requestedTaskCount);
         long baseSize = rangeSize / taskCount;
         long extra = rangeSize % taskCount;
-        long nextStart = start;
+        long nextIndex = 0L;
         List<TaskAssignment> assignments = new ArrayList<>(taskCount);
 
         for (int i = 0; i < taskCount; i++) {
             long taskSize = baseSize + (i < extra ? 1 : 0);
-            int taskStart = Math.toIntExact(nextStart);
-            int taskEnd = Math.toIntExact(nextStart + taskSize - 1);
             String taskId = UUID.randomUUID().toString();
-            ExecuteJobRequest taskRequest = ExecuteJobRequest.newBuilder()
+            ExecuteJobRequest.Builder taskRequest = ExecuteJobRequest.newBuilder()
                     .setJobType(jobType)
-                    .setStart(taskStart)
-                    .setEnd(taskEnd)
                     .setTaskId(taskId)
                     .putAllParameters(originalRequest.getParametersMap())
-                    .setPayload(originalRequest.getPayload())
-                    .build();
-            assignments.add(new TaskAssignment(taskRequest));
-            nextStart += taskSize;
+                    .setPayload(originalRequest.getPayload());
+            if (hasExplicitValues) {
+                int taskStart = Math.toIntExact(nextIndex);
+                int taskEnd = Math.toIntExact(nextIndex + taskSize);
+                taskRequest.addAllValues(originalRequest.getValuesList()
+                        .subList(taskStart, taskEnd));
+            } else {
+                taskRequest.setStart(Math.toIntExact((long) start + nextIndex))
+                        .setEnd(Math.toIntExact((long) start + nextIndex + taskSize - 1));
+            }
+            assignments.add(new TaskAssignment(taskRequest.build()));
+            nextIndex += taskSize;
         }
         return assignments;
     }
@@ -291,7 +308,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         private TaskProgress(TaskAssignment assignment) {
             taskRequest = assignment.taskRequest;
             taskId = assignment.taskRequest.getTaskId();
-            totalWork = (long) assignment.taskRequest.getEnd()
+            totalWork = assignment.taskRequest.getValuesCount() > 0
+                    ? assignment.taskRequest.getValuesCount()
+                    : (long) assignment.taskRequest.getEnd()
                     - assignment.taskRequest.getStart() + 1;
         }
     }
@@ -310,6 +329,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
 
     private static final class JobExecution {
         private final String jobId;
+        private final String jobType;
         private final Map<String, TaskProgress> tasks = new LinkedHashMap<>();
         private final ArrayDeque<TaskProgress> pendingTasks = new ArrayDeque<>();
         private final List<StreamObserver<JobProgressUpdate>> subscribers = new ArrayList<>();
@@ -319,12 +339,16 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         private JobStatus status = JobStatus.JOB_STATUS_QUEUED;
         private String message = "Job accepted and queued";
 
-        private JobExecution(String jobId, List<TaskAssignment> assignments,
+        private JobExecution(String jobId, String jobType, List<TaskAssignment> assignments,
                              List<WorkerInfo> availableWorkers) {
             this.jobId = jobId;
+            this.jobType = jobType;
             addAvailableWorkers(availableWorkers);
             for (TaskAssignment assignment : assignments) {
                 TaskProgress task = new TaskProgress(assignment);
+                if ("MAX".equals(jobType)) {
+                    task.result = Long.MIN_VALUE;
+                }
                 tasks.put(task.taskId, task);
                 pendingTasks.addLast(task);
             }
@@ -442,7 +466,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             task.state = SubTaskState.SUB_TASK_STATE_PENDING;
             task.workerStatus = WorkerStatus.WORKER_STATUS_FAILED;
             task.completionPercentage = 0.0;
-            task.result = 0L;
+            task.result = "MAX".equals(jobType) ? Long.MIN_VALUE : 0L;
             task.message = errorMessage;
             message = "Worker " + failedWorkerId + " failed; retrying unfinished sub-task";
             pendingTasks.addFirst(task);
@@ -525,13 +549,23 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                     .setUpdatedAtUnixMs(System.currentTimeMillis());
             long totalWork = 0;
             double completedWork = 0.0;
-            long totalResult = 0L;
+            long totalResult = "MAX".equals(jobType) ? Long.MIN_VALUE : 0L;
+            boolean hasMaximum = false;
             int activeWorkers = activeTasksByWorker.size();
 
             for (TaskProgress task : tasks.values()) {
                 totalWork += task.totalWork;
                 completedWork += task.totalWork * task.completionPercentage / 100.0;
-                totalResult += task.result;
+                if ("MAX".equals(jobType)) {
+                    if (task.state == SubTaskState.SUB_TASK_STATE_COMPLETED
+                            || task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                            && task.completionPercentage > 0.0) {
+                        totalResult = Math.max(totalResult, task.result);
+                        hasMaximum = true;
+                    }
+                } else {
+                    totalResult = Math.addExact(totalResult, task.result);
+                }
                 if (task.worker != null) {
                     update.addWorkers(WorkerStatusMetric.newBuilder()
                             .setWorkerId(task.worker.getId())
@@ -554,6 +588,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                 update.addSubTasks(subTask);
             }
             double completionPercentage = completedWork * 100.0 / totalWork;
+            if ("MAX".equals(jobType) && !hasMaximum) {
+                totalResult = 0L;
+            }
             if (status == JobStatus.JOB_STATUS_COMPLETED) {
                 completionPercentage = 100.0;
             }

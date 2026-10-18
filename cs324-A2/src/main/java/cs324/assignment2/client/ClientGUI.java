@@ -24,7 +24,8 @@ public class ClientGUI extends JFrame {
     private static final String BOOTSTRAP_HOST = "localhost";
     private static final int BOOTSTRAP_PORT = 50051;
 
-    private final JTextField jobTypeField = new JTextField("PRIMESUM", 10);
+    private final JComboBox<String> jobTypeSelector = new JComboBox<>(
+            new String[]{"SUM", "PRIMESUM", "MAX", "PRIMECOUNT"});
     private final JTextField startField   = new JTextField("1", 6);
     private final JTextField endField     = new JTextField("50", 6);
     private final JProgressBar progressBar = new JProgressBar(0, 1000);
@@ -51,7 +52,7 @@ public class ClientGUI extends JFrame {
 
         JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT));
         top.add(new JLabel("Job:"));
-        top.add(jobTypeField);
+        top.add(jobTypeSelector);
         top.add(new JLabel("Start:"));
         top.add(startField);
         top.add(new JLabel("End:"));
@@ -99,7 +100,7 @@ public class ClientGUI extends JFrame {
             return;
         }
 
-        String jobType = jobTypeField.getText().trim().toUpperCase();
+        String jobType = (String) jobTypeSelector.getSelectedItem();
         int start, end;
         try {
             start = Integer.parseInt(startField.getText().trim());
