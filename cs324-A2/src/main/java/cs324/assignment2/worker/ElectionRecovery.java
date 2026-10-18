@@ -6,9 +6,8 @@ import io.grpc.StatusRuntimeException;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Worker-owned election algorithm and replicated checkpoints. Bootstrap supplies
- * one ordered metadata view; it does not choose the lowest-JAC candidate.
- * Safety depends on that single bootstrap remaining available and trusted peers. */
+/** Worker-only election, view agreement and replicated checkpoint recovery.
+ * Bootstrap is used solely to discover the registered active worker endpoints. */
 final class ElectionRecovery {
     private final WorkerNode node;
     private final Object state = new Object(), admission = new Object();
@@ -26,7 +25,7 @@ final class ElectionRecovery {
     ElectionRecovery(WorkerNode node) { this.node = node; }
     void unavailable() { bootstrapReachable = false; }
     private ClusterView syncView() {
-        ClusterView current = node.bootstrap().getClusterView(GetClusterViewRequest.getDefaultInstance());
+        ClusterView current = node.metadata().current();
         return adopt(current);
     }
     private ClusterView adopt(ClusterView current) {
@@ -90,7 +89,7 @@ final class ElectionRecovery {
         }
     }
     private ClusterView begin(ClusterView observed, boolean force) {
-        return adopt(node.bootstrap().beginElection(BeginElectionRequest.newBuilder().setWorkerId(node.getMyId())
+        return adopt(node.metadata().begin(BeginElectionRequest.newBuilder().setWorkerId(node.getMyId())
                 .setObservedEpoch(observed.getEpoch()).setForce(force).build()));
     }
     void receiveElection(ElectionMessage message) {
@@ -141,7 +140,7 @@ final class ElectionRecovery {
                     .thenComparing(Comparator.comparingInt((CandidacyReport c) -> c.getCandidate().getId()).reversed()))
                     .orElseThrow().getCandidate();
         }
-        ClusterView published = adopt(node.bootstrap().publishCoordinator(PublishCoordinatorRequest.newBuilder()
+        ClusterView published = adopt(node.metadata().publish(PublishCoordinatorRequest.newBuilder()
                 .setEpoch(epoch).setInitiatorId(node.getMyId()).setCoordinatorId(winner.getId()).build()));
         if (published.getEpoch() == epoch && published.hasCoordinator())
             announcement(CoordinatorMessage.newBuilder().setEpoch(epoch).setElectionId(Long.toString(epoch))
@@ -238,7 +237,7 @@ final class ElectionRecovery {
                 merged.values().stream().filter(RecoveryRecord::getAdmittedJob)
                         .forEach(r -> acknowledgedAdmissions.add(r.getKey()));
             }
-            ClusterView ready = adopt(node.bootstrap().markCoordinatorReady(MarkCoordinatorReadyRequest.newBuilder()
+            ClusterView ready = adopt(node.metadata().ready(MarkCoordinatorReadyRequest.newBuilder()
                     .setEpoch(epoch).setCoordinatorId(node.getMyId()).build()));
             if (ready.getEpoch() == epoch && ready.getReady())
                 node.log("READY epoch=" + epoch + " recovered=" + merged.size() + " previousResponses=" + oldResponses);

@@ -87,8 +87,9 @@ It stops only the processes it started and leaves logs under `.demo/`.
 
 ## Implementation and remaining integration
 
-* `BootstrapServiceImpl`: registration, monotonic heartbeat timeouts and consistent
-  election/configuration metadata. It neither reports candidacy nor selects a winner.
+* `BootstrapServiceImpl`: registration, discovery and monotonic heartbeat timeouts only.
+* `WorkerElectionMetadata`: worker-owned epochs, configuration votes and readiness;
+  the lowest active ID serializes proposals, while candidacy chooses the coordinator.
 * `WorkerNode`: one gRPC server for networking, election, recovery and job execution;
   pooled channels, deadlines and shutdown cleanup.
 * `ElectionRecovery`: duplicate-suppressed flooding, complete candidate collection,
@@ -125,7 +126,7 @@ jobs in one GUI still need work. The GUI presently monitors one job at a time;
 separate clients and backend jobs can execute concurrently. The old WorkerService
 SubmitJob RPC is deprecated/UNIMPLEMENTED; use the JobService API used by the GUI.
 
-Bootstrap must remain available and retain its metadata. Full-cluster/bootstrap
+Bootstrap must remain available and retain its worker registry. Full-cluster/bootstrap
 restart recovery, TLS/authentication and replicated bootstrap are not implemented.
 Checkpoint bytes are kept in worker RAM. Recovery deliberately stops if a majority
 of the PREVIOUS replica set is unavailable; shrinking the live registry does not

@@ -26,8 +26,7 @@ public final class ResilientJobClient {
                 if (Thread.currentThread().isInterrupted()) throw new InterruptedException("Job monitoring cancelled");
                 ManagedChannel channel = null;
                 try {
-                    ClusterView view = BootstrapServiceGrpc.newBlockingStub(discovery).withDeadlineAfter(2, TimeUnit.SECONDS)
-                            .getClusterView(GetClusterViewRequest.getDefaultInstance());
+                    ClusterView view = WorkerDiscovery.discover(BootstrapServiceGrpc.newBlockingStub(discovery).withDeadlineAfter(2, TimeUnit.SECONDS));
                     if (!view.getReady() || !view.hasCoordinator()) { Thread.sleep(200); continue; }
                     WorkerInfo leader = view.getCoordinator();
                     channel = ManagedChannelBuilder.forAddress(leader.getHost(), leader.getPort()).usePlaintext().build();

@@ -33,7 +33,7 @@ public final class ClusterDemo {
         ManagedChannel bootstrapChannel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
         try {
             var bootstrap = BootstrapServiceGrpc.newBlockingStub(bootstrapChannel).withDeadlineAfter(3, TimeUnit.SECONDS);
-            ClusterView view = bootstrap.getClusterView(GetClusterViewRequest.getDefaultInstance());
+            ClusterView view = cs324.assignment2.client.WorkerDiscovery.discover(bootstrap);
             if (args[0].equals("status")) {
                 System.out.println("ACTIVE_WORKERS=" + bootstrap.getActiveWorkers(GetActiveWorkersRequest.getDefaultInstance()).getWorkersCount());
                 System.out.println("EPOCH=" + view.getEpoch());

@@ -20,7 +20,7 @@ class IntegratedClusterTest {
     private final List<ManagedChannel> clients = new ArrayList<>();
 
     @BeforeEach void setup() throws Exception {
-        bootstrapService = new BootstrapServiceImpl(1800, 150, 6000);
+        bootstrapService = new BootstrapServiceImpl(1800, 150);
         bootstrapServer = ServerBuilder.forPort(0).addService(bootstrapService).build().start();
         bootstrapChannel = ManagedChannelBuilder.forAddress("localhost", bootstrapServer.getPort()).usePlaintext().build();
         bootstrap = BootstrapServiceGrpc.newBlockingStub(bootstrapChannel);
@@ -40,7 +40,7 @@ class IntegratedClusterTest {
     private BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap() {
         return bootstrap.withDeadlineAfter(2, TimeUnit.SECONDS);
     }
-    private ClusterView view() { return bootstrap().getClusterView(GetClusterViewRequest.getDefaultInstance()); }
+    private ClusterView view() { return cs324.assignment2.client.WorkerDiscovery.discover(bootstrap()); }
     private static void await(BooleanSupplier condition) throws Exception {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(25);
         while (System.nanoTime() < deadline) {
@@ -72,6 +72,33 @@ class IntegratedClusterTest {
         for (WorkerNode worker : workers) {
             await(() -> worker.getMyCoordinatorId() == 3);
             assertFalse(worker.getNeighbours().isEmpty());
+        }
+    }
+    @Test void bootstrapExposesOnlyRegistrationDiscoveryAndHeartbeats() {
+        var methods = BootstrapServiceGrpc.getServiceDescriptor().getMethods().stream()
+                .map(io.grpc.MethodDescriptor::getBareMethodName).collect(java.util.stream.Collectors.toSet());
+        assertEquals(Set.of("RegisterWorker", "DeregisterWorker", "GetActiveWorkers", "Heartbeat"), methods);
+    }
+    @Test void concurrentWorkerTriggersAgreeAndRejectStaleViewVotes() throws Exception {
+        add(0); add(0); add(0); ready(3, 3);
+        ClusterView old = view();
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(3);
+        try {
+            List<java.util.concurrent.Callable<ClusterView>> triggers = workers.stream()
+                    .<java.util.concurrent.Callable<ClusterView>>map(worker -> () -> stubOnce(worker).beginElection(
+                            BeginElectionRequest.newBuilder().setWorkerId(worker.getMyId())
+                                    .setObservedEpoch(old.getEpoch()).setForce(true).build())).toList();
+            for (var result : pool.invokeAll(triggers)) assertEquals(old.getEpoch() + 1, result.get().getEpoch());
+        } finally { pool.shutdownNow(); }
+        ready(3, 3);
+        ClusterView elected = view();
+        assertEquals(old.getEpoch() + 1, elected.getEpoch());
+        for (WorkerNode worker : workers) {
+            var rejected = stubOnce(worker).voteView(ViewVoteRequest.newBuilder().setView(old)
+                    .setPhase(ViewPhase.RECOVERED).build());
+            assertFalse(rejected.getAccepted());
+            assertEquals(elected.getEpoch(), rejected.getCurrent().getEpoch());
+            assertEquals(3, rejected.getCurrent().getCoordinator().getId());
         }
     }
     @Test void coordinatorCrashRecoversAndBootstrapEvictsIt() throws Exception {
@@ -114,7 +141,7 @@ class IntegratedClusterTest {
     }
     @Test void initiatorCrashRetriesAfterMembershipRepair() throws Exception {
         WorkerNode initiator = add(0); add(0); add(0); ready(3, 3);
-        bootstrap().beginElection(BeginElectionRequest.newBuilder().setWorkerId(1).setObservedEpoch(view().getEpoch()).setForce(true).build());
+        stubOnce(initiator).beginElection(BeginElectionRequest.newBuilder().setWorkerId(1).setObservedEpoch(view().getEpoch()).setForce(true).build());
         initiator.crash(); ready(3, 2);
         assertTrue(save(workers.get(2), "continued", false).getAccepted());
     }

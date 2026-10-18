@@ -26,6 +26,7 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
     private ManagedChannel bootstrapChannel;
     private Server server;
     private volatile ElectionRecovery election;
+    private final WorkerElectionMetadata electionMetadata = new WorkerElectionMetadata(this);
     private final JobGrpcServiceImpl jobGrpcService = new JobGrpcServiceImpl(this);
     private final ExecutorService jobPool = Executors.newCachedThreadPool();
 
@@ -147,6 +148,25 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
     }
     @Override public void receiveCoordinatorMessage(CoordinatorMessage req, StreamObserver<Empty> out) {
         respond(out, () -> { controller().announcement(req); return Empty.getDefaultInstance(); });
+    }
+    WorkerElectionMetadata metadata() { return electionMetadata; }
+    @Override public void getClusterView(GetClusterViewRequest req, StreamObserver<ClusterView> out) {
+        respond(out, () -> metadata().current());
+    }
+    @Override public void beginElection(BeginElectionRequest req, StreamObserver<ClusterView> out) {
+        respond(out, () -> metadata().begin(req));
+    }
+    @Override public void publishCoordinator(PublishCoordinatorRequest req, StreamObserver<ClusterView> out) {
+        respond(out, () -> metadata().publish(req));
+    }
+    @Override public void markCoordinatorReady(MarkCoordinatorReadyRequest req, StreamObserver<ClusterView> out) {
+        respond(out, () -> metadata().ready(req));
+    }
+    @Override public void getElectionState(GetClusterViewRequest req, StreamObserver<ElectionState> out) {
+        respond(out, () -> metadata().localState(false));
+    }
+    @Override public void voteView(ViewVoteRequest req, StreamObserver<ElectionState> out) {
+        respond(out, () -> metadata().vote(req));
     }
     @Override public void getWorkerStatus(GetWorkerStatusRequest req, StreamObserver<WorkerStatus> out) {
         respond(out, () -> controller().status());

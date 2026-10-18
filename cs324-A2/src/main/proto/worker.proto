@@ -24,6 +24,14 @@ service WorkerService {
   rpc ReadRecovery (RecoveryRequest) returns (RecoverySnapshot);
   rpc ReplicateRecord (RecoveryRecord) returns (CheckpointAck);
 
+  // Worker-owned election metadata. Bootstrap only registers/discovers workers.
+  rpc GetClusterView (GetClusterViewRequest) returns (ClusterView);
+  rpc BeginElection (BeginElectionRequest) returns (ClusterView);
+  rpc PublishCoordinator (PublishCoordinatorRequest) returns (ClusterView);
+  rpc MarkCoordinatorReady (MarkCoordinatorReadyRequest) returns (ClusterView);
+  rpc GetElectionState (GetClusterViewRequest) returns (ElectionState);
+  rpc VoteView (ViewVoteRequest) returns (ElectionState);
+
   // Job execution (Aveshal)
   rpc ExecuteJob (ExecuteJobRequest) returns (ExecuteJobResponse);
   rpc ExecuteJobWithProgress (ExecuteJobRequest) returns (stream ExecuteJobProgress);
@@ -139,3 +147,42 @@ message RecoveryRecord {
   bool admitted_job = 5;
 }
 message RecoverySnapshot { repeated RecoveryRecord records = 1; }
+
+message GetClusterViewRequest {}
+message ClusterView {
+  int64 epoch = 1;
+  bootstrap.WorkerInfo initiator = 2;
+  bootstrap.WorkerInfo coordinator = 3;
+  bool ready = 4;
+  repeated bootstrap.WorkerInfo voters = 5;
+  repeated bootstrap.WorkerInfo previous_voters = 6;
+  int64 membership_version = 7;
+  bool election_in_progress = 8;
+}
+message BeginElectionRequest {
+  int32 worker_id = 1;
+  int64 observed_epoch = 2;
+  bool force = 3;
+}
+message PublishCoordinatorRequest {
+  int64 epoch = 1;
+  int32 initiator_id = 2;
+  int32 coordinator_id = 3;
+}
+message MarkCoordinatorReadyRequest {
+  int64 epoch = 1;
+  int32 coordinator_id = 2;
+}
+
+enum ViewPhase { PREPARE = 0; SELECTED = 1; RECOVERED = 2; }
+message ViewVoteRequest {
+  ClusterView view = 1;
+  ClusterView previous_ready = 2;
+  ViewPhase phase = 3;
+}
+message ElectionState {
+  ClusterView current = 1;
+  ClusterView last_ready = 2;
+  int64 promised_epoch = 3;
+  bool accepted = 4;
+}

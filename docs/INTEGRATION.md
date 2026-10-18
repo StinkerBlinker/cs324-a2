@@ -14,10 +14,21 @@ Bootstrap assigns worker IDs and removes workers after 5000 ms without a heartbe
 cleanup runs every 1000 ms. Heartbeats are sent every 1500 ms. Worker control RPCs
 have 600 ms deadlines. Monotonic time avoids wall-clock adjustments changing expiry.
 
-Bootstrap also stores a numbered epoch, round initiator, current voters, previous
-ready voters and a published coordinator endpoint. It does not join the neighbour
-overlay, flood messages, report a JAC or compare candidates. The initiating worker
-collects every current voter's candidacy and selects lowest JAC/highest ID.
+Bootstrap exposes only RegisterWorker, DeregisterWorker, GetActiveWorkers and
+Heartbeat. It stores no election epoch, coordinator endpoint or readiness flag.
+Workers own those records through WorkerService. The lowest registered worker ID
+serializes round proposals; this role does not determine the coordinator. Election
+messages still flood the neighbour overlay, and the initiating worker collects
+EVERY current voter's candidacy before choosing lowest JAC/highest ID.
+
+A preparation vote installs a strictly increasing epoch on current workers and
+carries the previous recovered replica configuration. All current voters must
+participate before candidacy collection can complete. Coordinator selection and
+post-recovery readiness are replicated to current workers. The elected worker
+serves only after every current voter acknowledges readiness. Clients discover
+worker endpoints through bootstrap and query WorkerService for the newest view.
+Concurrent triggers are forwarded to the round proposer; old epoch votes cannot
+replace a newer local view. A failed proposer is replaced after membership expiry.
 
 Membership changes invalidate readiness and start a new round. Failure of an
 election initiator is recovered through heartbeat expiry or a 12-second election
@@ -26,9 +37,9 @@ expired; a missing voter must report or be removed by a membership transition.
 Neighbour links retain random attachment and are repaired with a reciprocal ring
 over current voters, so losing a tree articulation worker does not strand survivors.
 
-This architecture deliberately relies on one available bootstrap for ordered
-metadata and discovery. If bootstrap is unreachable, new checkpoint admission
-fails and workers stop advertising ready leadership. Bootstrap state is in RAM;
+This architecture deliberately relies on one available bootstrap for membership
+and discovery. If bootstrap is unreachable, new checkpoint admission
+fails and workers stop advertising ready leadership. Registry state is in RAM;
 its restart is outside the supported failure model. It must not be silently
 replaced with a fresh empty registry while workers continue accepting jobs.
 
@@ -38,7 +49,7 @@ Before a new coordinator becomes ready it reads a majority of the PREVIOUS ready
 voters. Each read atomically raises that replica's promised epoch before returning
 records, so it will not subsequently accept an older coordinator's checkpoint.
 The coordinator merges the newest epoch/revision per key and writes those records
-to a majority of the NEW voters before publishing readiness through bootstrap.
+to a majority of the NEW voters before publishing readiness to the current workers.
 
 A shrinking active-worker list does not lower the required OLD read quorum.
 Three previous replicas need two previous responses, even if only one remains
