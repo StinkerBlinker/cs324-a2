@@ -1,273 +1,197 @@
 package cs324.assignment2.worker;
 
 import cs324.assignment2.grpc.*;
-import io.grpc.ManagedChannel;
-import io.grpc.ManagedChannelBuilder;
-import io.grpc.Server;
-import io.grpc.ServerBuilder;
+import io.grpc.*;
 import io.grpc.stub.StreamObserver;
-
-import java.io.IOException;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.*;
+import java.util.function.Supplier;
 
-public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
-
-    private static final int TERM_JOB_LIMIT = 5;
-    private static final long HEARTBEAT_INTERVAL_MS = 1500L;
-    private static final String BOOTSTRAP_HOST = "localhost";
-    private static final int BOOTSTRAP_PORT = 50051;
-
+/** Joshua's registration/neighbour service with integrated election and recovery.
+ * Each instance owns one gRPC server; job RPCs remain explicit integration hooks. */
+public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implements AutoCloseable {
     private final String leaderman = "cs324";
-
-    private int id = -1;
-    private int port = -1;
-
+    private final String bootstrapHost;
+    private final int bootstrapPort, requestedPort;
+    private final long rpcMs, heartbeatMs, monitorMs;
+    private volatile int id = -1, port = -1;
+    private volatile boolean stopped, registrationLost;
     private final List<WorkerInfo> neighbours = new CopyOnWriteArrayList<>();
-    private final AtomicInteger jac = new AtomicInteger(0);
-    private final AtomicInteger jobsThisTerm = new AtomicInteger(0);
-    private volatile int coordinatorId = -1;
-    private volatile long lastAcceptedElectionTimestamp = -1L;
-    private final AtomicBoolean electionInProgress = new AtomicBoolean(false);
-
-    private BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrapStub;
+    private final AtomicInteger jac = new AtomicInteger();
+    private final AtomicBoolean electionInProgress = new AtomicBoolean();
+    private final ConcurrentMap<Integer, ManagedChannel> channels = new ConcurrentHashMap<>();
+    private final ExecutorService floodPool = Executors.newCachedThreadPool();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private ManagedChannel bootstrapChannel;
+    private Server server;
+    private volatile ElectionRecovery election;
 
-    private final Set<String> seenElections = ConcurrentHashMap.newKeySet();
-    private final Set<String> seenCoordinations = ConcurrentHashMap.newKeySet();
-    private final Map<String, Map<Integer, Integer>> jacByWorkerId = new ConcurrentHashMap<>();
-
-    private final ExecutorService floodPool = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "flood-" + id);
-        t.setDaemon(true);
-        return t;
-    });
-
-    private final ScheduledExecutorService heartbeatScheduler =
-            Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "heartbeat");
-                t.setDaemon(true);
-                return t;
-            });
-
+    public WorkerNode() { this("localhost", 50051, 0, 0); }
+    public WorkerNode(String bootstrapHost, int bootstrapPort, int listenPort, int initialJac) {
+        this(bootstrapHost, bootstrapPort, listenPort, initialJac, 600, 1500, 400);
+    }
+    public WorkerNode(String bootstrapHost, int bootstrapPort, int listenPort, int initialJac,
+                      long rpcMs, long heartbeatMs, long monitorMs) {
+        if (initialJac < 0) throw new IllegalArgumentException("JAC must be nonnegative");
+        this.bootstrapHost = bootstrapHost; this.bootstrapPort = bootstrapPort;
+        this.requestedPort = listenPort; this.rpcMs = rpcMs;
+        this.heartbeatMs = heartbeatMs; this.monitorMs = monitorMs; jac.set(initialJac);
+    }
     public static void main(String[] args) throws Exception {
-        WorkerNode node = new WorkerNode();
-        node.start();
+        WorkerNode node = new WorkerNode(args.length > 0 ? args[0] : "localhost",
+                args.length > 1 ? Integer.parseInt(args[1]) : 50051,
+                args.length > 2 ? Integer.parseInt(args[2]) : 0,
+                args.length > 3 ? Integer.parseInt(args[3]) : 0);
+        Runtime.getRuntime().addShutdownHook(new Thread(node::close));
+        try { node.start(); node.awaitTermination(); }
+        finally { node.close(); }
     }
-
     public void start() throws Exception {
-        bootstrapChannel = ManagedChannelBuilder
-                .forAddress(BOOTSTRAP_HOST, BOOTSTRAP_PORT)
-                .usePlaintext()
-                .build();
-        bootstrapStub = BootstrapServiceGrpc.newBlockingStub(bootstrapChannel);
-
-        Server server = null;
-        Random random = new Random();
-        for (int attempt = 0; attempt < 40 && server == null; attempt++) {
-            this.port = 2000 + random.nextInt(1000);
-            try {
-                server = ServerBuilder.forPort(this.port)
-                        .addService(this)
-                        .build()
-                        .start();
-            } catch (IOException e) {
-                server = null;
-            }
-        }
-        if (server == null) {
-            throw new IllegalStateException("Could not bind a free gRPC port for this worker");
-        }
-
-        RegisterWorkerResponse reg = bootstrapStub.registerWorker(
-                RegisterWorkerRequest.newBuilder()
-                        .setHost("localhost")
-                        .setPort(this.port)
-                        .build());
-        this.id = reg.getWorkerId();
-        System.out.println("[Worker " + id + "] Registered successfully. leaderman=" + leaderman);
-        System.out.println("[Worker " + id + "] Listening on gRPC port " + this.port);
-
-        heartbeatScheduler.scheduleAtFixedRate(this::sendHeartbeat,
-                0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
-
-        joinNetwork();
-
-        server.awaitTermination();
+        try {
+            bootstrapChannel = ManagedChannelBuilder.forAddress(bootstrapHost, bootstrapPort).usePlaintext().build();
+            server = ServerBuilder.forPort(requestedPort).addService(this).build().start();
+            port = server.getPort();
+            id = bootstrap().registerWorker(RegisterWorkerRequest.newBuilder().setHost("localhost").setPort(port).build()).getWorkerId();
+            election = new ElectionRecovery(this);
+            log("Registered; gRPC port=" + port + "; leaderman=" + leaderman);
+            scheduler.scheduleWithFixedDelay(this::sendHeartbeat, 0, heartbeatMs, TimeUnit.MILLISECONDS);
+            joinNetwork();
+            scheduler.scheduleWithFixedDelay(() -> {
+                try { if (!stopped && !registrationLost) election.tick(); }
+                catch (Exception e) { election.unavailable(); log("monitor: " + e.getMessage()); }
+            }, 100, monitorMs, TimeUnit.MILLISECONDS);
+        } catch (Exception failure) { close(); throw failure; }
     }
-
-    private void joinNetwork() {
-        GetActiveWorkersResponse resp = bootstrapStub.getActiveWorkers(
-                GetActiveWorkersRequest.newBuilder().build());
-
-        List<WorkerInfo> others = resp.getWorkersList().stream()
-                .filter(w -> w.getId() != this.id)
-                .toList();
-
-        if (!others.isEmpty()) {
-            WorkerInfo randomNeighbour = others.get(new Random().nextInt(others.size()));
-            addNeighbourLocal(randomNeighbour);
-            System.out.println("[Worker " + id + "] Connected to neighbour: Worker "
-                    + randomNeighbour.getId());
-
-            try {
-                WorkerServiceGrpc.WorkerServiceBlockingStub neighbourStub =
-                        createWorkerStub(randomNeighbour);
-                neighbourStub.addNeighbour(AddNeighbourRequest.newBuilder()
-                        .setNeighbour(selfInfo())
-                        .build());
-
-                int existingCoordinator = neighbourStub.getCoordinatorId(
-                        GetCoordinatorIdRequest.newBuilder().build()).getCoordinatorId();
-
-                if (existingCoordinator == -1) {
-                    System.out.println("[Worker " + id + "] No coordinator known yet — starting election.");
-                    // TODO (Pranay): startElection();
-                } else {
-                    this.coordinatorId = existingCoordinator;
-                    System.out.println("[Worker " + id + "] Learned current coordinator: Worker "
-                            + coordinatorId);
-                }
-            } catch (Exception e) {
-                System.err.println("[Worker " + id + "] Could not contact neighbour: " + e.getMessage());
-            }
-        } else {
-            System.out.println("[Worker " + id + "] First worker in the network — self-electing as coordinator.");
-            this.coordinatorId = this.id;
-            this.jobsThisTerm.set(0);
-        }
+    public void awaitTermination() throws InterruptedException { server.awaitTermination(); }
+    BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap() {
+        return BootstrapServiceGrpc.newBlockingStub(bootstrapChannel).withDeadlineAfter(rpcMs, TimeUnit.MILLISECONDS);
     }
-
+    WorkerServiceGrpc.WorkerServiceBlockingStub peer(WorkerInfo worker) {
+        ManagedChannel channel = channels.computeIfAbsent(worker.getId(), ignored ->
+                ManagedChannelBuilder.forAddress(worker.getHost(), worker.getPort()).usePlaintext().build());
+        return WorkerServiceGrpc.newBlockingStub(channel).withDeadlineAfter(rpcMs, TimeUnit.MILLISECONDS);
+    }
     private void sendHeartbeat() {
         try {
-            HeartbeatResponse resp = bootstrapStub.heartbeat(
-                    HeartbeatRequest.newBuilder().setWorkerId(this.id).build());
-            if (!resp.getAcknowledged()) {
-                System.err.println("[Worker " + id + "] Bootstrap did not acknowledge heartbeat");
+            if (!bootstrap().heartbeat(HeartbeatRequest.newBuilder().setWorkerId(id).build()).getAcknowledged()) {
+                registrationLost = true; election.unavailable();
+                log("Registration expired; stop this process and rejoin with a new worker ID");
             }
-        } catch (Exception e) {
-            System.err.println("[Worker " + id + "] Heartbeat failed: " + e.getMessage());
+        } catch (StatusRuntimeException failure) { election.unavailable(); log("Heartbeat unavailable"); }
+    }
+    private void joinNetwork() {
+        List<WorkerInfo> others = new ArrayList<>(getActiveWorkersFromBootstrap());
+        Collections.shuffle(others);
+        for (WorkerInfo worker : others) if (worker.getId() != id) {
+            try {
+                peer(worker).addNeighbour(AddNeighbourRequest.newBuilder().setNeighbour(selfInfo()).build());
+                addNeighbourLocal(worker); log("Connected to neighbour " + worker.getId()); return;
+            } catch (StatusRuntimeException ignored) { }
         }
     }
-
-    private WorkerInfo selfInfo() {
-        return WorkerInfo.newBuilder()
-                .setId(this.id)
-                .setHost("localhost")
-                .setPort(this.port)
-                .build();
+    // A failed articulation node can split the random overlay. Add a reciprocal
+    // ring over the current voters while preserving existing random neighbours.
+    void repairOverlay(List<WorkerInfo> voters) {
+        List<WorkerInfo> sorted = voters.stream().sorted(Comparator.comparingInt(WorkerInfo::getId)).toList();
+        neighbours.removeIf(w -> sorted.stream().noneMatch(active -> active.getId() == w.getId()));
+        int index = -1;
+        for (int i = 0; i < sorted.size(); i++) if (sorted.get(i).getId() == id) index = i;
+        if (index < 0 || sorted.size() < 2) return;
+        Set<WorkerInfo> adjacent = new HashSet<>(List.of(sorted.get((index + 1) % sorted.size()),
+                sorted.get((index + sorted.size() - 1) % sorted.size())));
+        for (WorkerInfo worker : adjacent) try {
+            peer(worker).addNeighbour(AddNeighbourRequest.newBuilder().setNeighbour(selfInfo()).build());
+            addNeighbourLocal(worker);
+        } catch (StatusRuntimeException ignored) { }
     }
-
-    private void addNeighbourLocal(WorkerInfo neighbour) {
-        if (neighbour == null || neighbour.getId() == this.id) return;
-        for (WorkerInfo existing : neighbours) {
-            if (existing.getId() == neighbour.getId()) return;
-        }
-        neighbours.add(neighbour);
+    private void addNeighbourLocal(WorkerInfo worker) {
+        if (worker.getId() > 0 && worker.getId() != id && neighbours.stream().noneMatch(w -> w.getId() == worker.getId()))
+            neighbours.add(worker);
     }
-
-    private WorkerServiceGrpc.WorkerServiceBlockingStub createWorkerStub(WorkerInfo w) {
-        ManagedChannel ch = ManagedChannelBuilder
-                .forAddress(w.getHost(), w.getPort())
-                .usePlaintext()
-                .build();
-        return WorkerServiceGrpc.newBlockingStub(ch);
+    public WorkerInfo selfInfo() { return WorkerInfo.newBuilder().setId(id).setHost("localhost").setPort(port).build(); }
+    boolean stopped() { return stopped || registrationLost; }
+    void log(String message) { System.out.println("[Worker " + id + "] " + message); }
+    void dispatch(Runnable operation) {
+        if (!stopped) try { floodPool.execute(operation); } catch (RejectedExecutionException ignored) { }
     }
-
-    @Override
-    public void addNeighbour(AddNeighbourRequest request,
-                             StreamObserver<AddNeighbourResponse> responseObserver) {
-        addNeighbourLocal(request.getNeighbour());
-        System.out.println("[Worker " + id + "] New neighbour added: Worker "
-                + request.getNeighbour().getId());
-        responseObserver.onNext(AddNeighbourResponse.newBuilder().build());
-        responseObserver.onCompleted();
+    private ElectionRecovery controller() {
+        if (election == null || stopped()) throw Status.UNAVAILABLE.withDescription("Worker not registered/ready").asRuntimeException();
+        return election;
     }
-
-    @Override
-    public void getId(GetIdRequest request, StreamObserver<GetIdResponse> responseObserver) {
-        responseObserver.onNext(GetIdResponse.newBuilder().setId(this.id).build());
-        responseObserver.onCompleted();
+    private static <T> void respond(StreamObserver<T> out, Supplier<T> action) {
+        try { out.onNext(action.get()); out.onCompleted(); }
+        catch (StatusRuntimeException error) { out.onError(error); }
+        catch (IllegalArgumentException error) { out.onError(Status.INVALID_ARGUMENT.withDescription(error.getMessage()).asRuntimeException()); }
+        catch (IllegalStateException error) { out.onError(Status.FAILED_PRECONDITION.withDescription(error.getMessage()).asRuntimeException()); }
     }
-
-    @Override
-    public void getCoordinatorId(GetCoordinatorIdRequest request,
-                                 StreamObserver<GetCoordinatorIdResponse> responseObserver) {
-        responseObserver.onNext(GetCoordinatorIdResponse.newBuilder()
-                .setCoordinatorId(this.coordinatorId)
-                .build());
-        responseObserver.onCompleted();
+    @Override public void addNeighbour(AddNeighbourRequest req, StreamObserver<AddNeighbourResponse> out) {
+        addNeighbourLocal(req.getNeighbour()); out.onNext(AddNeighbourResponse.getDefaultInstance()); out.onCompleted();
     }
-
-    @Override
-    public void getJac(GetJacRequest request, StreamObserver<GetJacResponse> responseObserver) {
-        responseObserver.onNext(GetJacResponse.newBuilder().setJac(jac.get()).build());
-        responseObserver.onCompleted();
+    @Override public void getId(GetIdRequest req, StreamObserver<GetIdResponse> out) {
+        respond(out, () -> GetIdResponse.newBuilder().setId(id).build());
     }
-
-    // ---- Pranay TODOs ----
-    @Override
-    public void receiveElectionMessage(ElectionMessage request,
-                                       StreamObserver<Empty> responseObserver) {
-        // TODO (Pranay)
-        responseObserver.onNext(Empty.newBuilder().build());
-        responseObserver.onCompleted();
+    @Override public void getCoordinatorId(GetCoordinatorIdRequest req, StreamObserver<GetCoordinatorIdResponse> out) {
+        respond(out, () -> GetCoordinatorIdResponse.newBuilder().setCoordinatorId(controller().coordinatorId()).build());
     }
-
-    @Override
-    public void reportCandidacy(CandidacyReport request,
-                                StreamObserver<Empty> responseObserver) {
-        // TODO (Pranay)
-        responseObserver.onNext(Empty.newBuilder().build());
-        responseObserver.onCompleted();
+    @Override public void getJac(GetJacRequest req, StreamObserver<GetJacResponse> out) {
+        respond(out, () -> GetJacResponse.newBuilder().setJac(jac.get()).build());
     }
-
-    @Override
-    public void receiveCoordinatorMessage(CoordinatorMessage request,
-                                          StreamObserver<Empty> responseObserver) {
-        // TODO (Pranay)
-        responseObserver.onNext(Empty.newBuilder().build());
-        responseObserver.onCompleted();
+    @Override public void receiveElectionMessage(ElectionMessage req, StreamObserver<Empty> out) {
+        respond(out, () -> { controller().receiveElection(req); return Empty.getDefaultInstance(); });
     }
-
-    // ---- Aveshal TODOs ----
-    @Override
-    public void executeJob(ExecuteJobRequest request,
-                           StreamObserver<ExecuteJobResponse> responseObserver) {
-        // TODO (Aveshal)
-        responseObserver.onNext(ExecuteJobResponse.newBuilder()
-                .setResult(0)
-                .setTaskId(request.getTaskId())
-                .build());
-        responseObserver.onCompleted();
+    @Override public void reportCandidacy(CandidacyReport req, StreamObserver<Empty> out) {
+        respond(out, () -> { controller().candidate(req); return Empty.getDefaultInstance(); });
     }
-
-    @Override
-    public void submitJob(SubmitJobRequest request,
-                          StreamObserver<JobProgressUpdate> responseObserver) {
-        // TODO (Aveshal)
-        responseObserver.onNext(JobProgressUpdate.newBuilder()
-                .setOverallPercent(100.0)
-                .setFinalResult(0)
-                .setIsFinished(true)
-                .build());
-        responseObserver.onCompleted();
+    @Override public void receiveCoordinatorMessage(CoordinatorMessage req, StreamObserver<Empty> out) {
+        respond(out, () -> { controller().announcement(req); return Empty.getDefaultInstance(); });
     }
-
+    @Override public void getWorkerStatus(GetWorkerStatusRequest req, StreamObserver<WorkerStatus> out) {
+        respond(out, () -> controller().status());
+    }
+    @Override public void saveCheckpoint(SaveCheckpointRequest req, StreamObserver<CheckpointAck> out) {
+        respond(out, () -> controller().checkpoint(req));
+    }
+    @Override public void readRecovery(RecoveryRequest req, StreamObserver<RecoverySnapshot> out) {
+        respond(out, () -> controller().readRecovery(req.getEpoch()));
+    }
+    @Override public void replicateRecord(RecoveryRecord req, StreamObserver<CheckpointAck> out) {
+        respond(out, () -> controller().replicate(req));
+    }
+    @Override public void executeJob(ExecuteJobRequest req, StreamObserver<ExecuteJobResponse> out) {
+        // Aveshal's integration hook: never report a fabricated successful result.
+        out.onError(Status.UNIMPLEMENTED.withDescription("Job execution awaits job-engine integration").asRuntimeException());
+    }
+    @Override public void submitJob(SubmitJobRequest req, StreamObserver<JobProgressUpdate> out) {
+        out.onError(Status.UNIMPLEMENTED.withDescription("Job submission/progress awaits job-engine integration").asRuntimeException());
+    }
+    /** Job-engine hook: call with a stable ID and full input/task/result payload.
+     * A repeated admitted ID returns its existing state without counting a new job. */
+    public CheckpointAck checkpointJob(SaveCheckpointRequest request) { return controller().checkpoint(request); }
+    /** Call for each actual allocation/reassignment to another worker. Use stable
+     * job/task/attempt IDs; set admission remote_assignments=0 when using this. */
+    public void recordRemoteAssignment(String allocationId) { controller().recordRemoteAssignment(allocationId); }
+    public RecoverySnapshot recoveredJobs() { return controller().snapshot(); }
     public List<WorkerInfo> getActiveWorkersFromBootstrap() {
-        return bootstrapStub.getActiveWorkers(
-                GetActiveWorkersRequest.newBuilder().build()).getWorkersList();
+        return bootstrap().getActiveWorkers(GetActiveWorkersRequest.getDefaultInstance()).getWorkersList();
     }
-
     public int getMyId() { return id; }
-    public int getMyCoordinatorId() { return coordinatorId; }
+    public int getMyCoordinatorId() { return controller().coordinatorId(); }
     public List<WorkerInfo> getNeighbours() { return neighbours; }
     public AtomicInteger getJac() { return jac; }
     public AtomicBoolean getElectionInProgress() { return electionInProgress; }
     public ExecutorService getFloodPool() { return floodPool; }
+    public void crash() { stop(false); }
+    @Override public void close() { stop(true); }
+    private synchronized void stop(boolean deregister) {
+        if (stopped) return;
+        stopped = true;
+        scheduler.shutdownNow();
+        if (election != null) election.unavailable();
+        if (deregister && id > 0) try { bootstrap().deregisterWorker(DeregisterWorkerRequest.newBuilder().setWorkerId(id).build()); }
+        catch (StatusRuntimeException ignored) { }
+        if (server != null) server.shutdownNow();
+        floodPool.shutdownNow(); channels.values().forEach(ManagedChannel::shutdownNow);
+        if (bootstrapChannel != null) bootstrapChannel.shutdownNow();
+    }
 }

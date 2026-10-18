@@ -13,12 +13,13 @@ public class BootstrapNode {
     public static void main(String[] args) throws IOException, InterruptedException {
         BootstrapServiceImpl service = new BootstrapServiceImpl();
 
-        Server server = ServerBuilder.forPort(GRPC_PORT)
+        int listenPort = args.length == 0 ? GRPC_PORT : Integer.parseInt(args[0]);
+        Server server = ServerBuilder.forPort(listenPort)
                 .addService(service)
                 .build()
                 .start();
 
-        System.out.println("[Bootstrap] gRPC server started on port " + GRPC_PORT);
+        System.out.println("[Bootstrap] gRPC server started on port " + listenPort);
         System.out.println("[Bootstrap] Waiting for workers to register...");
         System.out.println("[Bootstrap] Heartbeat timeout = "
                 + BootstrapServiceImpl.HEARTBEAT_TIMEOUT_MS + " ms");

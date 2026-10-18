@@ -19,6 +19,10 @@ service WorkerService {
   rpc ReceiveElectionMessage (ElectionMessage) returns (Empty);
   rpc ReportCandidacy (CandidacyReport) returns (Empty);
   rpc ReceiveCoordinatorMessage (CoordinatorMessage) returns (Empty);
+  rpc GetWorkerStatus (GetWorkerStatusRequest) returns (WorkerStatus);
+  rpc SaveCheckpoint (SaveCheckpointRequest) returns (CheckpointAck);
+  rpc ReadRecovery (RecoveryRequest) returns (RecoverySnapshot);
+  rpc ReplicateRecord (RecoveryRecord) returns (CheckpointAck);
 
   // Job execution (Aveshal)
   rpc ExecuteJob (ExecuteJobRequest) returns (ExecuteJobResponse);
@@ -50,17 +54,20 @@ message GetJacResponse {
 message ElectionMessage {
   string election_id = 1;
   bootstrap.WorkerInfo initiator = 2;
+  int64 epoch = 3;
 }
 
 message CandidacyReport {
   bootstrap.WorkerInfo candidate = 1;
   int32 jac = 2;
   string election_id = 3;
+  int64 epoch = 4;
 }
 
 message CoordinatorMessage {
   string election_id = 1;
   bootstrap.WorkerInfo coordinator = 2;
+  int64 epoch = 3;
 }
 
 message ExecuteJobRequest {
@@ -93,3 +100,31 @@ message WorkerProgress {
   double percent_done  = 2;
   string status        = 3;
 }
+
+message GetWorkerStatusRequest {}
+message WorkerStatus {
+  bootstrap.WorkerInfo self = 1;
+  int64 epoch = 2;
+  int32 coordinator_id = 3;
+  bool ready = 4;
+  int32 jac = 5;
+  int32 jobs_this_term = 6;
+  bool election_in_progress = 7;
+}
+message SaveCheckpointRequest {
+  string key = 1;
+  bytes payload = 2;
+  // New job admission must use a stable key; retries do not count twice.
+  bool new_job = 3;
+  int32 remote_assignments = 4;
+}
+message CheckpointAck { bool accepted = 1; string detail = 2; }
+message RecoveryRequest { int64 epoch = 1; }
+message RecoveryRecord {
+  string key = 1;
+  bytes payload = 2;
+  int64 epoch = 3;
+  int64 revision = 4;
+  bool admitted_job = 5;
+}
+message RecoverySnapshot { repeated RecoveryRecord records = 1; }
