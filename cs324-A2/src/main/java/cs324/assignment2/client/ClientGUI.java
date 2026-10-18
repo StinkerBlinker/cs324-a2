@@ -26,7 +26,7 @@ public class ClientGUI extends JFrame {
     private final JTextField jobTypeField = new JTextField("PRIMESUM", 10);
     private final JTextField startField   = new JTextField("1", 6);
     private final JTextField endField     = new JTextField("50", 6);
-    private final JProgressBar progressBar = new JProgressBar(0, 100);
+    private final JProgressBar progressBar = new JProgressBar(0, 1000);
     private final JTextArea logArea = new JTextArea(12, 50);
     private final JLabel resultLabel = new JLabel("Result: —");
 
@@ -156,8 +156,12 @@ public class ClientGUI extends JFrame {
                                             @Override
                                             public void onNext(JobProgressUpdate update) {
                                                 SwingUtilities.invokeLater(() -> {
-                                                    progressBar.setValue((int) update
-                                                            .getCompletionPercentage());
+                                                    double percentage = update
+                                                            .getCompletionPercentage();
+                                                    progressBar.setValue((int) Math.round(
+                                                            percentage * 10.0));
+                                                    progressBar.setString(String.format("%.1f%%",
+                                                            percentage));
                                                     if (update.getStatus()
                                                             == JobStatus.JOB_STATUS_COMPLETED) {
                                                         resultLabel.setText("Result: "

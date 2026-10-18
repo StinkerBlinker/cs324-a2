@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     private static final int TERM_JOB_LIMIT = 5;
+    private static final int PROGRESS_UPDATE_TARGET = 1000;
     private static final long HEARTBEAT_INTERVAL_MS = 1500L;
     private static final String BOOTSTRAP_HOST = "localhost";
     private static final int BOOTSTRAP_PORT = 50051;
@@ -326,7 +327,8 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
     private static long calculateRange(String jobType, int start, int end,
                                        JobProgressListener progressListener) {
         long itemCount = (long) end - start + 1;
-        long progressInterval = Math.max(1L, itemCount / 100L);
+        long progressInterval = Math.max(1L,
+                (itemCount + PROGRESS_UPDATE_TARGET - 1) / PROGRESS_UPDATE_TARGET);
         long result = 0L;
         long completed = 0L;
         boolean primeSum = "PRIMESUM".equalsIgnoreCase(jobType);

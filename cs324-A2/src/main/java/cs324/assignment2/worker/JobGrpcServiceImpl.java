@@ -241,6 +241,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
     private static final class TaskProgress {
         private final WorkerInfo worker;
         private final String taskId;
+        private final long totalWork;
         private SubTaskState state = SubTaskState.SUB_TASK_STATE_PENDING;
         private WorkerStatus workerStatus = WorkerStatus.WORKER_STATUS_IDLE;
         private double completionPercentage;
@@ -250,6 +251,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         private TaskProgress(TaskAssignment assignment) {
             worker = assignment.worker;
             taskId = assignment.taskRequest.getTaskId();
+            totalWork = (long) assignment.taskRequest.getEnd()
+                    - assignment.taskRequest.getStart() + 1;
         }
     }
 
@@ -278,12 +281,18 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         }
 
         private synchronized void start() {
+            if (isTerminal()) {
+                return;
+            }
             status = JobStatus.JOB_STATUS_RUNNING;
             message = "Job is running";
             publish();
         }
 
         private synchronized void markRunning(String taskId) {
+            if (isTerminal()) {
+                return;
+            }
             TaskProgress task = tasks.get(taskId);
             if (task == null || task.state != SubTaskState.SUB_TASK_STATE_PENDING) {
                 return;
@@ -295,6 +304,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         }
 
         private synchronized void updateProgress(String taskId, double percentage, long result) {
+            if (isTerminal()) {
+                return;
+            }
             TaskProgress task = tasks.get(taskId);
             if (task == null || task.state != SubTaskState.SUB_TASK_STATE_RUNNING) {
                 return;
@@ -305,6 +317,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         }
 
         private synchronized void markCompleted(String taskId, long result) {
+            if (isTerminal()) {
+                return;
+            }
             TaskProgress task = tasks.get(taskId);
             if (task == null || isTaskTerminal(task.state)) {
                 return;
@@ -319,6 +334,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         }
 
         private synchronized void markFailed(String taskId, String errorMessage) {
+            if (isTerminal()) {
+                return;
+            }
             TaskProgress task = tasks.get(taskId);
             if (task == null || isTaskTerminal(task.state)) {
                 return;
@@ -327,7 +345,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             task.workerStatus = WorkerStatus.WORKER_STATUS_FAILED;
             task.message = errorMessage;
             message = errorMessage;
-            updateTerminalStatus();
+            status = JobStatus.JOB_STATUS_FAILED;
             publish();
         }
 
@@ -367,12 +385,14 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                     .setStatus(status)
                     .setMessage(message)
                     .setUpdatedAtUnixMs(System.currentTimeMillis());
-            double totalPercentage = 0.0;
+            long totalWork = 0;
+            double completedWork = 0.0;
             long totalResult = 0L;
             int activeWorkers = 0;
 
             for (TaskProgress task : tasks.values()) {
-                totalPercentage += task.completionPercentage;
+                totalWork += task.totalWork;
+                completedWork += task.totalWork * task.completionPercentage / 100.0;
                 totalResult += task.result;
                 if (task.workerStatus == WorkerStatus.WORKER_STATUS_ACTIVE) {
                     activeWorkers++;
@@ -393,7 +413,11 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                         .setWorkerId(task.worker.getId())
                         .setMessage(task.message));
             }
-            update.setCompletionPercentage(totalPercentage / tasks.size())
+            double completionPercentage = completedWork * 100.0 / totalWork;
+            if (status == JobStatus.JOB_STATUS_COMPLETED) {
+                completionPercentage = 100.0;
+            }
+            update.setCompletionPercentage(completionPercentage)
                     .setActiveWorkerCount(activeWorkers)
                     .setResult(totalResult);
             return update.build();
