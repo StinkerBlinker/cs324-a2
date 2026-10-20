@@ -6,6 +6,7 @@ import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.Status;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
@@ -16,6 +17,8 @@ import java.util.Set;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
 
@@ -59,6 +62,12 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
     private final ScheduledExecutorService heartbeatScheduler =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "heartbeat");
+                t.setDaemon(true);
+                return t;
+            });
+    private final ScheduledExecutorService taskHeartbeatScheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "task-heartbeat");
                 t.setDaemon(true);
                 return t;
             });
@@ -295,29 +304,109 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
             return;
         }
 
-        jobPool.execute(() -> {
-            try {
-                long result = calculateJob(request,
-                        (percentage, partialResult) -> responseObserver.onNext(
-                                ExecuteJobProgress.newBuilder()
-                                        .setTaskId(request.getTaskId())
-                                        .setCompletionPercentage(percentage)
-                                        .setResult(partialResult)
-                                        .build()));
-                responseObserver.onNext(ExecuteJobProgress.newBuilder()
-                        .setTaskId(request.getTaskId())
-                        .setCompletionPercentage(100.0)
-                        .setResult(result)
-                        .setIsFinished(true)
-                        .build());
-                responseObserver.onCompleted();
-            } catch (ArithmeticException e) {
-                responseObserver.onError(Status.OUT_OF_RANGE
-                        .withDescription("The job result exceeds the supported 64-bit range")
-                        .withCause(e)
-                        .asRuntimeException());
+        ServerCallStreamObserver<ExecuteJobProgress> serverObserver =
+                asServerObserver(responseObserver);
+        AtomicReference<Future<?>> task = new AtomicReference<>();
+        serverObserver.setOnCancelHandler(() -> {
+            Future<?> runningTask = task.get();
+            if (runningTask != null) {
+                runningTask.cancel(true);
             }
         });
+
+        try {
+            Future<?> runningTask = jobPool.submit(() -> {
+                AtomicReference<Double> completion = new AtomicReference<>(0.0);
+                AtomicLong partialResult = new AtomicLong();
+                ScheduledFuture<?> heartbeat = taskHeartbeatScheduler.scheduleAtFixedRate(() -> {
+                    ExecuteJobProgress update = ExecuteJobProgress.newBuilder()
+                            .setTaskId(request.getTaskId())
+                            .setCompletionPercentage(completion.get())
+                            .setResult(partialResult.get())
+                            .setHeartbeat(true)
+                            .build();
+                    sendTaskProgress(serverObserver, update);
+                }, 1, 1, TimeUnit.SECONDS);
+                try {
+                    long result = calculateJob(request,
+                            (percentage, resultSoFar) -> {
+                                completion.set(percentage);
+                                partialResult.set(resultSoFar);
+                                sendTaskProgress(serverObserver, ExecuteJobProgress.newBuilder()
+                                        .setTaskId(request.getTaskId())
+                                        .setCompletionPercentage(percentage)
+                                        .setResult(resultSoFar)
+                                        .build());
+                            });
+                    heartbeat.cancel(false);
+                    synchronized (serverObserver) {
+                        if (!serverObserver.isCancelled()) {
+                            serverObserver.onNext(ExecuteJobProgress.newBuilder()
+                                    .setTaskId(request.getTaskId())
+                                    .setCompletionPercentage(100.0)
+                                    .setResult(result)
+                                    .setIsFinished(true)
+                                    .build());
+                            serverObserver.onCompleted();
+                        }
+                    }
+                } catch (ArithmeticException e) {
+                    synchronized (serverObserver) {
+                        if (!serverObserver.isCancelled()) {
+                            serverObserver.onError(Status.OUT_OF_RANGE
+                                    .withDescription(
+                                            "The job result exceeds the supported 64-bit range")
+                                    .withCause(e)
+                                    .asRuntimeException());
+                        }
+                    }
+                } catch (CancellationException e) {
+                    if (!serverObserver.isCancelled()) {
+                        synchronized (serverObserver) {
+                            serverObserver.onError(Status.CANCELLED
+                                    .withDescription("Task execution was interrupted")
+                                    .withCause(e)
+                                    .asRuntimeException());
+                        }
+                    }
+                } catch (RuntimeException e) {
+                    synchronized (serverObserver) {
+                        if (!serverObserver.isCancelled()) {
+                            serverObserver.onError(Status.INTERNAL
+                                    .withDescription("Task execution failed")
+                                    .withCause(e)
+                                    .asRuntimeException());
+                        }
+                    }
+                } finally {
+                    heartbeat.cancel(false);
+                }
+            });
+            task.set(runningTask);
+            if (serverObserver.isCancelled()) {
+                runningTask.cancel(true);
+            }
+        } catch (RejectedExecutionException e) {
+            responseObserver.onError(Status.UNAVAILABLE
+                    .withDescription("Worker is shutting down")
+                    .withCause(e)
+                    .asRuntimeException());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static ServerCallStreamObserver<ExecuteJobProgress> asServerObserver(
+            StreamObserver<ExecuteJobProgress> observer) {
+        return (ServerCallStreamObserver<ExecuteJobProgress>) observer;
+    }
+
+    private static void sendTaskProgress(ServerCallStreamObserver<ExecuteJobProgress> observer,
+                                         ExecuteJobProgress update) {
+        synchronized (observer) {
+            if (!observer.isCancelled()) {
+                observer.onNext(update);
+            }
+        }
     }
 
     private static boolean isSupportedJobType(String jobType) {
@@ -343,6 +432,9 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
         boolean maximum = "MAX".equals(jobType);
 
         for (long index = 0; index < itemCount; index++) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CancellationException("Task execution was interrupted");
+            }
             long value = values.isEmpty()
                     ? (long) request.getStart() + index
                     : values.get(Math.toIntExact(index));
@@ -368,6 +460,9 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase {
             return false;
         }
         for (long divisor = 2; divisor <= value / divisor; divisor++) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new CancellationException("Task execution was interrupted");
+            }
             if (value % divisor == 0) {
                 return false;
             }

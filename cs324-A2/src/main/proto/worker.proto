@@ -85,6 +85,7 @@ message ExecuteJobProgress {
   int64 result = 3;
   bool is_finished = 4;
   string error_message = 5;
+  bool heartbeat = 6;
 }
 
 message SubmitJobRequest {

@@ -235,7 +235,7 @@ public class ClientGUI extends JFrame {
             while (updates.hasNext()) {
                 JobProgressUpdate update = updates.next();
                 terminalUpdate = update;
-                showProgress(jobNumber, progressView, update);
+                showProgress(jobNumber, job, progressView, update);
             }
             if (terminalUpdate == null) {
                 finishJob(jobNumber, job, progressView, "Failed",
@@ -355,19 +355,22 @@ public class ClientGUI extends JFrame {
         return fallback;
     }
 
-    private void showProgress(int jobNumber, JobProgressView view, JobProgressUpdate update) {
+    private void showProgress(int jobNumber, QueuedJob job, JobProgressView view,
+                              JobProgressUpdate update) {
         double percentage = Math.max(0.0, Math.min(100.0, update.getCompletionPercentage()));
+        String status = displayJobStatus(update.getStatus());
+        setQueueStatus(job, status, job.result);
         SwingUtilities.invokeLater(() -> {
             view.progressBar.setValue((int) Math.round(percentage * 10.0));
             view.progressBar.setString(String.format("%.1f%%", percentage));
-            view.statusLabel.setText(update.getStatus().toString());
+            view.statusLabel.setText(status);
         });
         List<Object[]> workerRows = new ArrayList<>();
         for (WorkerStatusMetric worker : update.getWorkersList()) {
             workerRows.add(new Object[]{
                     "Job " + jobNumber,
                     worker.getWorkerId(),
-                    worker.getStatus(),
+                    displayWorkerStatus(worker.getStatus()),
                     String.format("%.1f%%", worker.getCompletionPercentage()),
                     worker.getActiveSubTaskCount(),
                     worker.getCompletedSubTaskCount(),
@@ -379,7 +382,31 @@ public class ClientGUI extends JFrame {
             refreshWorkerTable();
         });
         publishStatus(String.format("Job %d: %.1f%% - %s - active workers: %d",
-                jobNumber, percentage, update.getMessage(), update.getActiveWorkerCount()));
+                jobNumber, percentage, status + " - " + update.getMessage(),
+                update.getActiveWorkerCount()));
+    }
+
+    private static String displayJobStatus(JobStatus status) {
+        return switch (status) {
+            case JOB_STATUS_QUEUED -> "Queued";
+            case JOB_STATUS_RUNNING -> "Active";
+            case JOB_STATUS_SLOW -> "Slow";
+            case JOB_STATUS_COMPLETED -> "Completed";
+            case JOB_STATUS_FAILED -> "Failed";
+            case JOB_STATUS_CANCELLED -> "Cancelled";
+            default -> "Unknown";
+        };
+    }
+
+    private static String displayWorkerStatus(cs324.assignment2.job.grpc.WorkerStatus status) {
+        return switch (status) {
+            case WORKER_STATUS_IDLE -> "Idle";
+            case WORKER_STATUS_ACTIVE -> "Active";
+            case WORKER_STATUS_SLOW -> "Slow";
+            case WORKER_STATUS_UNAVAILABLE -> "Unavailable";
+            case WORKER_STATUS_FAILED -> "Failed";
+            default -> "Unknown";
+        };
     }
 
     private void finishJob(int jobNumber, QueuedJob job, JobProgressView view,

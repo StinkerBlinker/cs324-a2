@@ -16,6 +16,7 @@ import io.grpc.ManagedChannelBuilder;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.Status;
+import io.grpc.stub.ServerCallStreamObserver;
 import io.grpc.stub.StreamObserver;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -236,10 +237,61 @@ class JobGrpcServiceImplTest {
                 "The progress stream should report the failed-worker retry");
     }
 
+    @Test
+    @Timeout(10)
+    void progressingTaskBecomesSlowThenFailsAtHardDeadlineAndIsCancelled() throws Exception {
+        ProgressWorker slowWorker = new ProgressWorker(false, false, true);
+        replaceCoordinatorExecutor(slowWorker, 700, 200, 400);
+
+        var response = jobStub.submitJob(jobRequest("SUM", 1, 1));
+        List<JobProgressUpdate> updates = readProgress(response.getJobId());
+        JobProgressUpdate terminal = updates.get(updates.size() - 1);
+
+        assertTrue(updates.stream().anyMatch(update ->
+                        update.getStatus() == JobStatus.JOB_STATUS_SLOW),
+                "A task approaching its deadline should be reported as slow");
+        assertEquals(JobStatus.JOB_STATUS_FAILED, terminal.getStatus());
+        assertEquals(SubTaskState.SUB_TASK_STATE_FAILED,
+                terminal.getSubTasks(0).getState());
+        assertTrue(terminal.getMessage().contains("failed"));
+        assertTrue(slowWorker.awaitCancelled(2, TimeUnit.SECONDS),
+                "The worker stream should be cancelled when the hard deadline expires");
+    }
+
+    @Test
+    @Timeout(10)
+    void taskWithoutProgressOrHeartbeatFailsAndCancelsWorkerStream() throws Exception {
+        ProgressWorker silentWorker = new ProgressWorker(false, false, false);
+        replaceCoordinatorExecutor(silentWorker, 2_000, 200, 400);
+
+        var response = jobStub.submitJob(jobRequest("SUM", 1, 1));
+        JobProgressUpdate terminal = lastProgress(response.getJobId());
+
+        assertEquals(JobStatus.JOB_STATUS_FAILED, terminal.getStatus());
+        assertTrue(terminal.getSubTasks(0).getMessage()
+                        .contains("stopped sending task heartbeats"),
+                "A task with no worker heartbeats should fail before its hard deadline");
+        assertTrue(silentWorker.awaitCancelled(2, TimeUnit.SECONDS));
+    }
+
     private void replaceCoordinatorExecutor(ProgressWorker replacement) throws Exception {
         coordinatorServer.shutdownNow();
         coordinatorServer.awaitTermination();
         workerServers.remove(coordinatorServer);
+        replaceCoordinatorExecutor(replacement, 60_000, 45_000, 5_000);
+    }
+
+    private void replaceCoordinatorExecutor(ProgressWorker replacement, long deadlineMs,
+                                            long slowAfterMs, long heartbeatTimeoutMs)
+            throws Exception {
+        if (!coordinatorServer.isShutdown()) {
+            coordinatorServer.shutdownNow();
+            coordinatorServer.awaitTermination();
+            workerServers.remove(coordinatorServer);
+        }
+        jobService.close();
+        jobService = new JobGrpcServiceImpl(coordinatorWorker, deadlineMs, slowAfterMs,
+                heartbeatTimeoutMs);
         coordinatorServer = ServerBuilder.forPort(0)
                 .addService(replacement)
                 .addService(jobService)
@@ -325,13 +377,29 @@ class JobGrpcServiceImplTest {
     private static final class ProgressWorker extends WorkerServiceGrpc.WorkerServiceImplBase {
         private final boolean failFirstCall;
         private final boolean blockFirstCall;
+        private final boolean sendProgressWhileRunning;
+        private final boolean silent;
         private final AtomicInteger calls = new AtomicInteger();
         private final CountDownLatch firstTaskStarted = new CountDownLatch(1);
         private final CountDownLatch releaseTask = new CountDownLatch(1);
+        private final CountDownLatch taskCancelled = new CountDownLatch(1);
 
         private ProgressWorker(boolean failFirstCall, boolean blockFirstCall) {
+            this(failFirstCall, blockFirstCall, false, false);
+        }
+
+        private ProgressWorker(boolean failFirstCall, boolean blockFirstCall,
+                               boolean sendProgressWhileRunning) {
+            this(failFirstCall, blockFirstCall, sendProgressWhileRunning,
+                    !sendProgressWhileRunning && !failFirstCall && !blockFirstCall);
+        }
+
+        private ProgressWorker(boolean failFirstCall, boolean blockFirstCall,
+                               boolean sendProgressWhileRunning, boolean silent) {
             this.failFirstCall = failFirstCall;
             this.blockFirstCall = blockFirstCall;
+            this.sendProgressWhileRunning = sendProgressWhileRunning;
+            this.silent = silent;
         }
 
         @Override
@@ -339,6 +407,10 @@ class JobGrpcServiceImplTest {
                                            StreamObserver<ExecuteJobProgress> responseObserver) {
             int callNumber = calls.incrementAndGet();
             firstTaskStarted.countDown();
+            if (silent) {
+                awaitCancellation(responseObserver);
+                return;
+            }
 
             if (failFirstCall && callNumber == 1) {
                 responseObserver.onNext(ExecuteJobProgress.newBuilder()
@@ -370,6 +442,31 @@ class JobGrpcServiceImplTest {
                 }
             }
 
+            if (sendProgressWhileRunning) {
+                ServerCallStreamObserver<ExecuteJobProgress> serverObserver =
+                        asServerObserver(responseObserver);
+                serverObserver.setOnCancelHandler(taskCancelled::countDown);
+                double percentage = 1.0;
+                while (!serverObserver.isCancelled()) {
+                    synchronized (serverObserver) {
+                        if (!serverObserver.isCancelled()) {
+                            serverObserver.onNext(ExecuteJobProgress.newBuilder()
+                                    .setTaskId(request.getTaskId())
+                                    .setCompletionPercentage(percentage)
+                                    .build());
+                        }
+                    }
+                    percentage = percentage >= 99.0 ? 1.0 : percentage + 1.0;
+                    try {
+                        Thread.sleep(20);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                return;
+            }
+
             responseObserver.onNext(ExecuteJobProgress.newBuilder()
                     .setTaskId(request.getTaskId())
                     .setCompletionPercentage(50.0)
@@ -399,6 +496,30 @@ class JobGrpcServiceImplTest {
 
         private int getCalls() {
             return calls.get();
+        }
+
+        private boolean awaitCancelled(long timeout, TimeUnit unit) throws InterruptedException {
+            return taskCancelled.await(timeout, unit);
+        }
+
+        private void awaitCancellation(StreamObserver<ExecuteJobProgress> responseObserver) {
+            ServerCallStreamObserver<ExecuteJobProgress> serverObserver =
+                    asServerObserver(responseObserver);
+            serverObserver.setOnCancelHandler(taskCancelled::countDown);
+            while (!serverObserver.isCancelled()) {
+                try {
+                    Thread.sleep(20);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+
+        @SuppressWarnings("unchecked")
+        private static ServerCallStreamObserver<ExecuteJobProgress> asServerObserver(
+                StreamObserver<ExecuteJobProgress> responseObserver) {
+            return (ServerCallStreamObserver<ExecuteJobProgress>) responseObserver;
         }
 
         private static long sum(int start, int end) {

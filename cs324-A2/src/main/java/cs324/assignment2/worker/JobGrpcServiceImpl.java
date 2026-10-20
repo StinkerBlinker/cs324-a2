@@ -14,6 +14,8 @@ import cs324.assignment2.job.grpc.SubmitJobRequest;
 import cs324.assignment2.job.grpc.SubmitJobResponse;
 import cs324.assignment2.job.grpc.WorkerStatus;
 import cs324.assignment2.job.grpc.WorkerStatusMetric;
+import io.grpc.stub.ClientCallStreamObserver;
+import io.grpc.stub.ClientResponseObserver;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -30,25 +32,51 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         implements AutoCloseable {
 
     private static final int TASKS_PER_WORKER = 20;
     private static final int MAX_TASK_COUNT = 10_000;
-    private static final long WORKER_TASK_TIMEOUT_SECONDS = 60L;
+    private static final long TASK_DEADLINE_MS = TimeUnit.SECONDS.toMillis(60);
+    private static final long TASK_SLOW_AFTER_MS = TimeUnit.SECONDS.toMillis(45);
+    private static final long TASK_HEARTBEAT_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(5);
 
     private final WorkerNode localWorker;
+    private final long taskDeadlineNanos;
+    private final long taskSlowAfterNanos;
+    private final long taskHeartbeatTimeoutNanos;
     private final Map<String, JobExecution> jobs = new ConcurrentHashMap<>();
     private final ExecutorService dispatchPool = Executors.newCachedThreadPool(r -> {
         Thread thread = new Thread(r, "job-dispatch");
         thread.setDaemon(true);
         return thread;
     });
+    private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "job-watchdog");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     public JobGrpcServiceImpl(WorkerNode localWorker) {
+        this(localWorker, TASK_DEADLINE_MS, TASK_SLOW_AFTER_MS, TASK_HEARTBEAT_TIMEOUT_MS);
+    }
+
+    JobGrpcServiceImpl(WorkerNode localWorker, long taskDeadlineMs,
+                       long taskSlowAfterMs, long taskHeartbeatTimeoutMs) {
+        if (taskDeadlineMs <= 0 || taskSlowAfterMs <= 0
+                || taskSlowAfterMs >= taskDeadlineMs || taskHeartbeatTimeoutMs <= 0) {
+            throw new IllegalArgumentException("Task monitoring thresholds must be positive "
+                    + "and the slow threshold must be below the deadline");
+        }
         this.localWorker = localWorker;
+        taskDeadlineNanos = TimeUnit.MILLISECONDS.toNanos(taskDeadlineMs);
+        taskSlowAfterNanos = TimeUnit.MILLISECONDS.toNanos(taskSlowAfterMs);
+        taskHeartbeatTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(taskHeartbeatTimeoutMs);
+        watchdog.scheduleAtFixedRate(this::checkTaskHealth, 100, 100, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -121,7 +149,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         List<TaskAssignment> assignments = createAssignments(
                 request, jobType, start, end, workers);
         String jobId = UUID.randomUUID().toString();
-        JobExecution job = new JobExecution(jobId, jobType, assignments, workers);
+        JobExecution job = new JobExecution(jobId, jobType, assignments, workers,
+                taskDeadlineNanos, taskSlowAfterNanos);
         jobs.put(jobId, job);
 
         responseObserver.onNext(SubmitJobResponse.newBuilder()
@@ -197,6 +226,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         if (attempt == null) {
             return;
         }
+        if (!job.markStarted(attempt, System.nanoTime())) {
+            return;
+        }
         ManagedChannel channel;
         try {
             channel = ManagedChannelBuilder.forAddress(
@@ -211,36 +243,69 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         }
 
         try {
+            AtomicReference<ClientCallStreamObserver<ExecuteJobRequest>> call =
+                    new AtomicReference<>();
+            job.setCancellationAction(attempt, () -> {
+                ClientCallStreamObserver<ExecuteJobRequest> activeCall = call.get();
+                if (activeCall != null) {
+                    activeCall.cancel("Task deadline or progress timeout exceeded", null);
+                }
+                channel.shutdownNow();
+            });
             WorkerServiceGrpc.newStub(channel)
-                    .withDeadlineAfter(WORKER_TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    .withDeadlineAfter(TASK_DEADLINE_MS + TimeUnit.SECONDS.toMillis(5),
+                            TimeUnit.MILLISECONDS)
                     .executeJobWithProgress(
                     task.taskRequest,
-                    new StreamObserver<ExecuteJobProgress>() {
+                    new ClientResponseObserver<ExecuteJobRequest, ExecuteJobProgress>() {
+                        @Override
+                        public void beforeStart(
+                                ClientCallStreamObserver<ExecuteJobRequest> requestStream) {
+                            call.set(requestStream);
+                        }
+
                         @Override
                         public void onNext(ExecuteJobProgress update) {
                             if (!update.getErrorMessage().isEmpty()) {
                                 handleWorkerFailure(job, attempt, update.getErrorMessage());
+                            } else if (update.getHeartbeat()) {
+                                if (job.updateHeartbeat(attempt, System.nanoTime())) {
+                                    schedule(job);
+                                }
                             } else if (update.getIsFinished()) {
-                                job.completeTask(attempt, update.getResult());
-                                schedule(job);
+                                if (job.completeTask(attempt, update.getResult(),
+                                        System.nanoTime())) {
+                                    schedule(job);
+                                }
                             } else {
-                                job.updateProgress(attempt,
-                                        update.getCompletionPercentage(), update.getResult());
+                                if (job.updateProgress(attempt,
+                                        update.getCompletionPercentage(), update.getResult(),
+                                        System.nanoTime())) {
+                                    schedule(job);
+                                }
                             }
                         }
 
                         @Override
                         public void onError(Throwable error) {
-                            handleWorkerFailure(job, attempt,
-                                    "Worker " + attempt.worker.getId()
-                                            + " failed: " + error.getMessage());
+                            if (Status.fromThrowable(error).getCode() == Status.Code.DEADLINE_EXCEEDED) {
+                                if (job.failTask(attempt, "Task exceeded its 60-second deadline",
+                                        false, System.nanoTime())) {
+                                    schedule(job);
+                                }
+                            } else {
+                                handleWorkerFailure(job, attempt,
+                                        "Worker " + attempt.worker.getId()
+                                                + " failed: " + error.getMessage());
+                            }
                             channel.shutdown();
                         }
 
                         @Override
                         public void onCompleted() {
                             channel.shutdown();
-                            if (job.failIfIncomplete(attempt)) {
+                            if (job.clearCancellationAction(attempt)
+                                    && job.failIfIncomplete(attempt)) {
                                 refreshWorkersAndSchedule(job);
                             } else {
                                 schedule(job);
@@ -258,6 +323,16 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
     private void handleWorkerFailure(JobExecution job, TaskAttempt attempt, String errorMessage) {
         if (job.requeueAfterWorkerFailure(attempt, errorMessage)) {
             refreshWorkersAndSchedule(job);
+        }
+    }
+
+    private void checkTaskHealth() {
+        long now = System.nanoTime();
+        for (JobExecution job : jobs.values()) {
+            if (job.checkTaskHealth(now, taskDeadlineNanos, taskSlowAfterNanos,
+                    taskHeartbeatTimeoutNanos)) {
+                schedule(job);
+            }
         }
     }
 
@@ -282,6 +357,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
 
     @Override
     public void close() {
+        watchdog.shutdownNow();
         dispatchPool.shutdownNow();
     }
 
@@ -304,6 +380,10 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         private int attemptNumber;
         private long result;
         private String message = "Waiting for assignment";
+        private long startedAtNanos;
+        private long lastProgressAtNanos;
+        private long lastHeartbeatAtNanos;
+        private Runnable cancellationAction;
 
         private TaskProgress(TaskAssignment assignment) {
             taskRequest = assignment.taskRequest;
@@ -330,6 +410,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
     private static final class JobExecution {
         private final String jobId;
         private final String jobType;
+        private final long taskDeadlineNanos;
+        private final long taskSlowAfterNanos;
         private final Map<String, TaskProgress> tasks = new LinkedHashMap<>();
         private final ArrayDeque<TaskProgress> pendingTasks = new ArrayDeque<>();
         private final List<StreamObserver<JobProgressUpdate>> subscribers = new ArrayList<>();
@@ -340,9 +422,12 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         private String message = "Job accepted and queued";
 
         private JobExecution(String jobId, String jobType, List<TaskAssignment> assignments,
-                             List<WorkerInfo> availableWorkers) {
+                             List<WorkerInfo> availableWorkers, long taskDeadlineNanos,
+                             long taskSlowAfterNanos) {
             this.jobId = jobId;
             this.jobType = jobType;
+            this.taskDeadlineNanos = taskDeadlineNanos;
+            this.taskSlowAfterNanos = taskSlowAfterNanos;
             addAvailableWorkers(availableWorkers);
             for (TaskAssignment assignment : assignments) {
                 TaskProgress task = new TaskProgress(assignment);
@@ -399,6 +484,10 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                 task.state = SubTaskState.SUB_TASK_STATE_RUNNING;
                 task.workerStatus = WorkerStatus.WORKER_STATUS_ACTIVE;
                 task.message = "Executing";
+                task.startedAtNanos = 0L;
+                task.lastProgressAtNanos = 0L;
+                task.lastHeartbeatAtNanos = 0L;
+                task.cancellationAction = null;
                 activeTasksByWorker.put(worker.getId(), task.taskId);
                 task.attemptNumber++;
                 assigned.add(task);
@@ -416,37 +505,185 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             return new TaskAttempt(task, task.worker, task.attemptNumber);
         }
 
-        private synchronized void updateProgress(TaskAttempt attempt,
-                                                 double percentage, long result) {
+        private synchronized boolean markStarted(TaskAttempt attempt, long nowNanos) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
+                return false;
+            }
+            task.startedAtNanos = nowNanos;
+            task.lastProgressAtNanos = nowNanos;
+            task.lastHeartbeatAtNanos = nowNanos;
+            return true;
+        }
+
+        private synchronized void setCancellationAction(TaskAttempt attempt, Runnable action) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (isCurrentAttempt(task, attempt)) {
+                task.cancellationAction = action;
+            } else {
+                action.run();
+            }
+        }
+
+        private synchronized boolean clearCancellationAction(TaskAttempt attempt) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
+                return false;
+            }
+            task.cancellationAction = null;
+            return true;
+        }
+
+        private synchronized boolean updateProgress(TaskAttempt attempt,
+                                                    double percentage, long result,
+                                                    long nowNanos) {
             if (isTerminal()) {
-                return;
+                return false;
             }
             TaskProgress task = tasks.get(attempt.task.taskId);
             if (!isCurrentAttempt(task, attempt)) {
-                return;
+                return false;
+            }
+            if (nowNanos - task.startedAtNanos >= taskDeadlineNanos) {
+                return failTaskLocked(task, "Task exceeded its 60-second deadline", false);
             }
             task.completionPercentage = Math.max(0.0, Math.min(100.0, percentage));
             task.result = result;
+            task.lastProgressAtNanos = nowNanos;
+            task.lastHeartbeatAtNanos = nowNanos;
+            boolean approachingDeadline = nowNanos - task.startedAtNanos >= taskSlowAfterNanos;
+            task.state = approachingDeadline
+                    ? SubTaskState.SUB_TASK_STATE_SLOW : SubTaskState.SUB_TASK_STATE_RUNNING;
+            task.workerStatus = approachingDeadline
+                    ? WorkerStatus.WORKER_STATUS_SLOW : WorkerStatus.WORKER_STATUS_ACTIVE;
+            task.message = approachingDeadline
+                    ? "Progress is slower than expected" : "Executing";
+            updateTerminalStatus();
             publish();
+            return false;
         }
 
-        private synchronized void completeTask(TaskAttempt attempt, long result) {
+        private synchronized boolean updateHeartbeat(TaskAttempt attempt, long nowNanos) {
             if (isTerminal()) {
-                return;
+                return false;
             }
             TaskProgress task = tasks.get(attempt.task.taskId);
             if (!isCurrentAttempt(task, attempt)) {
-                return;
+                return false;
+            }
+            if (nowNanos - task.startedAtNanos >= taskDeadlineNanos) {
+                return failTaskLocked(task, "Task exceeded its 60-second deadline", false);
+            }
+            task.lastHeartbeatAtNanos = nowNanos;
+            return false;
+        }
+
+        private synchronized boolean completeTask(TaskAttempt attempt, long result,
+                                                  long nowNanos) {
+            if (isTerminal()) {
+                return false;
+            }
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
+                return false;
+            }
+            if (nowNanos - task.startedAtNanos >= taskDeadlineNanos) {
+                return failTaskLocked(task, "Task exceeded its 60-second deadline", false);
             }
             task.result = result;
             task.completionPercentage = 100.0;
             task.state = SubTaskState.SUB_TASK_STATE_COMPLETED;
             task.workerStatus = WorkerStatus.WORKER_STATUS_IDLE;
             task.message = "Completed";
+            task.cancellationAction = null;
             activeTasksByWorker.remove(attempt.worker.getId(), task.taskId);
             failIfNoWorkersCanContinue();
             updateTerminalStatus();
             publish();
+            return true;
+        }
+
+        private synchronized boolean failTask(TaskAttempt attempt, String reason,
+                                              boolean workerUnavailable, long nowNanos) {
+            TaskProgress task = tasks.get(attempt.task.taskId);
+            if (!isCurrentAttempt(task, attempt)) {
+                return false;
+            }
+            String failureReason = nowNanos - task.startedAtNanos >= taskDeadlineNanos
+                    ? "Task exceeded its 60-second deadline" : reason;
+            return failTaskLocked(task, failureReason, workerUnavailable);
+        }
+
+        private boolean failTaskLocked(TaskProgress task, String reason,
+                                       boolean workerUnavailable) {
+            Runnable cancel = task.cancellationAction;
+            task.cancellationAction = null;
+            task.state = SubTaskState.SUB_TASK_STATE_FAILED;
+            task.workerStatus = WorkerStatus.WORKER_STATUS_FAILED;
+            task.message = reason;
+            if (task.worker != null) {
+                int workerId = task.worker.getId();
+                activeTasksByWorker.remove(workerId, task.taskId);
+                if (workerUnavailable) {
+                    failedWorkerIds.add(workerId);
+                    workers.remove(workerId);
+                }
+            }
+            failIfNoWorkersCanContinue();
+            updateTerminalStatus();
+            publish();
+            if (cancel != null) {
+                cancel.run();
+            }
+            return true;
+        }
+
+        private synchronized boolean checkTaskHealth(long nowNanos, long deadlineNanos,
+                                                     long slowAfterNanos,
+                                                     long heartbeatTimeoutNanos) {
+            if (isTerminal()) {
+                return false;
+            }
+            boolean changed = false;
+            long progressLagThresholdNanos = Math.min(slowAfterNanos,
+                    heartbeatTimeoutNanos / 2);
+            for (TaskProgress task : tasks.values()) {
+                if (task.state != SubTaskState.SUB_TASK_STATE_RUNNING
+                        && task.state != SubTaskState.SUB_TASK_STATE_SLOW) {
+                    continue;
+                }
+                if (task.startedAtNanos == 0L) {
+                    continue;
+                }
+                long elapsedNanos = nowNanos - task.startedAtNanos;
+                if (elapsedNanos >= deadlineNanos) {
+                    changed |= failTaskLocked(task, "Task exceeded its 60-second deadline", false);
+                    continue;
+                }
+                if (nowNanos - task.lastHeartbeatAtNanos >= heartbeatTimeoutNanos) {
+                    changed |= failTaskLocked(task,
+                            "Worker stopped sending task heartbeats", true);
+                    continue;
+                }
+                boolean slow = elapsedNanos >= slowAfterNanos
+                        || nowNanos - task.lastProgressAtNanos >= progressLagThresholdNanos;
+                if (slow && task.state != SubTaskState.SUB_TASK_STATE_SLOW) {
+                    task.state = SubTaskState.SUB_TASK_STATE_SLOW;
+                    task.workerStatus = WorkerStatus.WORKER_STATUS_SLOW;
+                    task.message = "Progress is slower than expected";
+                    changed = true;
+                } else if (!slow && task.state == SubTaskState.SUB_TASK_STATE_SLOW) {
+                    task.state = SubTaskState.SUB_TASK_STATE_RUNNING;
+                    task.workerStatus = WorkerStatus.WORKER_STATUS_ACTIVE;
+                    task.message = "Executing";
+                    changed = true;
+                }
+            }
+            if (changed) {
+                updateTerminalStatus();
+                publish();
+            }
+            return changed;
         }
 
         private synchronized boolean requeueAfterWorkerFailure(TaskAttempt attempt,
@@ -459,6 +696,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                 return false;
             }
             int failedWorkerId = attempt.worker.getId();
+            Runnable cancel = task.cancellationAction;
+            task.cancellationAction = null;
             failedWorkerIds.add(failedWorkerId);
             workers.remove(failedWorkerId);
             activeTasksByWorker.remove(failedWorkerId, task.taskId);
@@ -470,6 +709,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             task.message = errorMessage;
             message = "Worker " + failedWorkerId + " failed; retrying unfinished sub-task";
             pendingTasks.addFirst(task);
+            if (cancel != null) {
+                cancel.run();
+            }
             publish();
             return !isTerminal();
         }
@@ -485,7 +727,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
 
         private boolean isCurrentAttempt(TaskProgress task, TaskAttempt attempt) {
             return task != null
-                    && task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                    && (task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                    || task.state == SubTaskState.SUB_TASK_STATE_SLOW)
                     && task.attemptNumber == attempt.attemptNumber
                     && task.worker != null
                     && task.worker.getId() == attempt.worker.getId();
@@ -515,7 +758,10 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             failIfNoWorkersCanContinueLocked();
             boolean allTerminal = tasks.values().stream().allMatch(task -> isTaskTerminal(task.state));
             if (!allTerminal) {
-                status = JobStatus.JOB_STATUS_RUNNING;
+                boolean slow = tasks.values().stream()
+                        .anyMatch(task -> task.state == SubTaskState.SUB_TASK_STATE_SLOW);
+                status = slow ? JobStatus.JOB_STATUS_SLOW : JobStatus.JOB_STATUS_RUNNING;
+                message = slow ? "One or more tasks are progressing slowly" : "Job is running";
                 return;
             }
             boolean failed = tasks.values().stream()
@@ -572,7 +818,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                             .setStatus(task.workerStatus)
                             .setCompletionPercentage(task.completionPercentage)
                             .setActiveSubTaskCount(
-                                    task.state == SubTaskState.SUB_TASK_STATE_RUNNING ? 1 : 0)
+                                    task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                                            || task.state == SubTaskState.SUB_TASK_STATE_SLOW
+                                            ? 1 : 0)
                             .setCompletedSubTaskCount(
                                     task.state == SubTaskState.SUB_TASK_STATE_COMPLETED ? 1 : 0)
                             .setStatusMessage(task.message));
