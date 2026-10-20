@@ -1,12 +1,9 @@
 package cs324.assignment2.client;
 
 import org.junit.jupiter.api.Test;
-
 import java.io.StringReader;
 import java.util.List;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.*;
 
 class CsvJobLoaderTest {
     @Test void manualListsRetainOrderNegativeValuesAndDuplicates() {
@@ -15,34 +12,35 @@ class CsvJobLoaderTest {
         assertThrows(IllegalArgumentException.class, () -> CsvJobLoader.parseManualValues("2, nope, 3"));
     }
 
-    @Test
-    void parsesRangesAndExplicitValuesWithoutDroppingDuplicates() throws Exception {
-        String csv = "job_type,start,end,values\r\n"
-                + "SUM,1,10,\r\n"
-                + "MAX,,,\"9, -4, 21, 3, 21\"\r\n"
-                + "PRIMECOUNT,,,\"2, 3, 3, 4, 5, 5, 5\"\r\n";
-
-        List<ClientGUI.QueuedJob> jobs = CsvJobLoader.parse(new StringReader(csv));
-
-        assertEquals(3, jobs.size());
-        assertEquals("SUM", jobs.get(0).jobType);
-        assertEquals(1, jobs.get(0).start);
-        assertEquals(10, jobs.get(0).end);
-        assertEquals(List.of(9L, -4L, 21L, 3L, 21L), jobs.get(1).values);
-        assertEquals(List.of(2L, 3L, 3L, 4L, 5L, 5L, 5L), jobs.get(2).values);
+    @Test void allRowsFormOneDatasetAndRetainDuplicates() throws Exception {
+        assertEquals(List.of(9L, -4L, 21L, 3L, 21L, 2L),
+                CsvJobLoader.parseValues(new StringReader("9,-4,21\r\n3,21,2\r\n")));
     }
 
-    @Test
-    void parsesCommaDelimitedNumberListsInsideQuotedCsvField() throws Exception {
-        List<ClientGUI.QueuedJob> jobs = CsvJobLoader.parse(
-                new StringReader("job_type,start,end,values\r\nMAX,,,\"1, 2, 3\"\r\n"));
-        assertEquals(List.of(1L, 2L, 3L), jobs.get(0).values);
+    @Test void acceptsQuotedNumbersWhitespaceAndByteOrderMark() throws Exception {
+        assertEquals(List.of(2L, 3L, -5L), CsvJobLoader.parseValues(
+                new StringReader("\uFEFF2,\"3\", -5\n")));
     }
 
-    @Test
-    void rejectsInvalidJobRows() {
-        String csv = "job_type,start,end,values\nMAX,4,2,\n";
-        assertThrows(IllegalArgumentException.class,
-                () -> CsvJobLoader.parse(new StringReader(csv)));
+    @Test void rejectsEmptyCellsInsteadOfSilentlyDroppingValues() {
+        for (String text : List.of("", "\n\n", "1,,3", "1,2,", "1,nope,3")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> CsvJobLoader.parseValues(new StringReader(text)));
+        }
+    }
+
+    @Test void rejectsJobDefinitionHeaders() {
+        assertThrows(IllegalArgumentException.class, () -> CsvJobLoader.parseValues(
+                new StringReader("job_type,start,end,values\nMAX,,,1\n")));
+    }
+
+    @Test void largeDatasetIsNotSplitIntoSeparateJobsOrTruncated() throws Exception {
+        StringBuilder csv = new StringBuilder();
+        for (int i = 0; i < 100_000; i++) csv.append(i == 0 ? "" : i % 100 == 0 ? "\n" : ",").append(i);
+        List<Long> values = CsvJobLoader.parseValues(new StringReader(csv.toString()));
+        assertEquals(100_000, values.size());
+        assertEquals(0L, values.getFirst());
+        assertEquals(99_999L, values.getLast());
+        assertEquals(4_999_950_000L, values.stream().mapToLong(Long::longValue).sum());
     }
 }

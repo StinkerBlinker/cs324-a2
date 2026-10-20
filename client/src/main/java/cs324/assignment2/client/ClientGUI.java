@@ -35,7 +35,7 @@ public class ClientGUI extends JFrame {
     private final JTextArea logArea = new JTextArea(12, 50);
     private final JButton submitButton = new JButton("Submit Job");
     private final JButton loadCsvButton = new JButton("Load CSV");
-    private final JButton submitQueueButton = new JButton("Submit Queue");
+    private final JButton manualInputButton = new JButton("Use manual input");
     private final JButton detailsButton = new JButton("Show worker details");
     private final JPanel detailsPanel = new JPanel(new BorderLayout());
     private final JPanel jobProgressList = new JPanel();
@@ -47,20 +47,14 @@ public class ClientGUI extends JFrame {
     private static final Color ACCENT = new Color(37, 99, 185);
     private final JPanel numbersPanel = new JPanel(new BorderLayout(10, 0));
     private final JLabel detailsHeading = new JLabel("Worker breakdown - All jobs");
-    private final JLabel queueSummary = new JLabel("No CSV jobs loaded");
+    private final JLabel datasetSummary = new JLabel("Enter numbers manually, or load one CSV dataset.");
+    private List<Long> csvValues = List.of();
+    private String csvFilename = "";
+    private String manualNumbersText = "9, -4, 21, 3, 21";
     private final JLabel emptyProgress = new JLabel("Submit a job or load a CSV to get started.");
     private int selectedJobNumber = -1;
     private final ExecutorService jobExecutor = Executors.newFixedThreadPool(4);
     private final AtomicInteger nextJobNumber = new AtomicInteger(1);
-    private final List<QueuedJob> queuedJobs = new ArrayList<>();
-    private final DefaultTableModel queueTableModel = new DefaultTableModel(
-            new Object[]{"Job #", "Job Type", "Input", "Status", "Result"}, 0) {
-        @Override
-        public boolean isCellEditable(int row, int column) {
-            return false;
-        }
-    };
-    private final JTable queueTable = new JTable(queueTableModel);
     private final DefaultTableModel workerTableModel = new DefaultTableModel(
             new Object[]{"Job", "Worker ID", "Status", "Progress", "Active Tasks",
                     "Completed Tasks", "Metrics"}, 0) {
@@ -117,11 +111,12 @@ public class ClientGUI extends JFrame {
         loadCsvButton.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(ACCENT), new EmptyBorder(8, 15, 8, 15)));
         loadCsvButton.setFocusPainted(false);
-        loadCsvButton.setToolTipText("Choose a .csv file to add jobs to the batch queue");
+        loadCsvButton.setToolTipText("Load one dataset of comma-separated numbers for MAX or PRIMECOUNT");
         addInput(inputs, loadCsvButton, c, 7, 0);
-        styleButton(submitQueueButton, "Submit all queued CSV jobs; up to four are monitored concurrently");
+        styleButton(manualInputButton, "Clear the loaded dataset and return to typing numbers");
+        manualInputButton.setVisible(false);
         c.insets = new Insets(0, 0, 0, 0);
-        addInput(inputs, submitQueueButton, c, 8, 0);
+        addInput(inputs, manualInputButton, c, 8, 0);
 
         numbersPanel.setOpaque(false);
         numbersPanel.add(new JLabel("Numbers"), BorderLayout.WEST);
@@ -134,7 +129,12 @@ public class ClientGUI extends JFrame {
         inputCard.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(new Color(222, 228, 236)), new EmptyBorder(14, 14, 14, 14)));
         inputCard.add(inputs, BorderLayout.NORTH);
-        inputCard.add(numbersPanel, BorderLayout.SOUTH);
+        JPanel listInputs = new JPanel(new BorderLayout(0, 8));
+        listInputs.setOpaque(false);
+        listInputs.add(numbersPanel, BorderLayout.NORTH);
+        datasetSummary.setForeground(MUTED);
+        listInputs.add(datasetSummary, BorderLayout.SOUTH);
+        inputCard.add(listInputs, BorderLayout.SOUTH);
         JPanel top = new JPanel(new BorderLayout(0, 16));
         top.setOpaque(false);
         top.add(heading, BorderLayout.NORTH);
@@ -165,28 +165,15 @@ public class ClientGUI extends JFrame {
         logArea.setForeground(INK);
         JScrollPane logScroll = new JScrollPane(logArea);
         logScroll.setBorder(BorderFactory.createEmptyBorder());
-        styleTable(queueTable);
-        queueTable.setAutoCreateRowSorter(true);
-        queueTable.getColumnModel().getColumn(2).setPreferredWidth(340);
-        JScrollPane queueScroll = new JScrollPane(queueTable);
-        queueScroll.setBorder(BorderFactory.createEmptyBorder());
-        JPanel queuePanel = new JPanel(new BorderLayout());
-        queueSummary.setForeground(MUTED);
-        queueSummary.setBorder(new EmptyBorder(8, 12, 8, 12));
-        queuePanel.add(queueSummary, BorderLayout.NORTH);
-        queuePanel.add(queueScroll, BorderLayout.CENTER);
-        JTabbedPane activityTabs = new JTabbedPane();
-        activityTabs.addTab("Live logs", logScroll);
-        activityTabs.addTab("CSV queue", queuePanel);
-        activityTabs.setToolTipTextAt(1, "Inspect loaded inputs, submission status and results");
-        JSplitPane progressAndLogs = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
-                progressPanel, activityTabs);
+        JPanel logsPanel = section("Live logs", logScroll);
+        progressAndLogs.setTopComponent(progressPanel);
+        progressAndLogs.setBottomComponent(logsPanel);
         progressAndLogs.setResizeWeight(0.52);
         progressAndLogs.setContinuousLayout(true);
         progressAndLogs.setBorder(BorderFactory.createEmptyBorder());
         progressAndLogs.setDividerSize(8);
         progressPanel.setMinimumSize(new Dimension(0, 85));
-        activityTabs.setMinimumSize(new Dimension(0, 85));
+        logsPanel.setMinimumSize(new Dimension(0, 85));
 
         styleTable(workerTable);
         workerTable.getColumnModel().getColumn(6).setPreferredWidth(220);
@@ -222,10 +209,18 @@ public class ClientGUI extends JFrame {
         footer.add(footerHint, BorderLayout.EAST);
         root.add(footer, BorderLayout.SOUTH);
         jobTypeSelector.addActionListener(e -> updateInputMode());
+        jobTypeSelector.setSelectedItem("MAX");
         updateInputMode();
         submitButton.addActionListener(e -> submitJob());
         loadCsvButton.addActionListener(e -> loadCsv());
-        submitQueueButton.addActionListener(e -> submitQueuedJobs());
+        manualInputButton.addActionListener(e -> {
+            csvValues = List.of();
+            csvFilename = "";
+            numbersField.setEditable(true);
+            numbersField.setText(manualNumbersText);
+            datasetSummary.setText("Enter numbers manually, or load one CSV dataset.");
+            manualInputButton.setVisible(false);
+        });
         detailsButton.addActionListener(e -> toggleWorkerDetails());
         getRootPane().setDefaultButton(submitButton);
         addWindowListener(new java.awt.event.WindowAdapter() {
@@ -284,6 +279,10 @@ public class ClientGUI extends JFrame {
         endField.setEnabled(!list);
         numbersField.setEnabled(list);
         numbersPanel.setVisible(list);
+        manualInputButton.setVisible(list && !csvValues.isEmpty());
+        datasetSummary.setText(!list ? "Range job: use Start and End. CSV datasets are used by MAX and PRIMECOUNT."
+                : csvValues.isEmpty() ? "Enter numbers manually, or load one CSV dataset."
+                : String.format("%,d numbers loaded from %s - one dataset, one submitted job", csvValues.size(), csvFilename));
         revalidate();
         repaint();
     }
@@ -291,7 +290,8 @@ public class ClientGUI extends JFrame {
     private void submitJob() {
         String jobType = (String) jobTypeSelector.getSelectedItem();
         if ("MAX".equals(jobType) || "PRIMECOUNT".equals(jobType)) {
-            try { startJob(QueuedJob.values(jobType, CsvJobLoader.parseManualValues(numbersField.getText()))); }
+            try { startJob(QueuedJob.values(jobType, csvValues.isEmpty()
+                    ? CsvJobLoader.parseManualValues(numbersField.getText()) : csvValues)); }
             catch (IllegalArgumentException error) { log(error.getMessage()); }
             return;
         }
@@ -318,7 +318,7 @@ public class ClientGUI extends JFrame {
         }
         JFileChooser chooser = new JFileChooser(directory);
         chooser.setCurrentDirectory(directory);
-        chooser.setDialogTitle("Load batch jobs from CSV");
+        chooser.setDialogTitle("Load a numeric dataset from CSV");
         chooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
         chooser.setAcceptAllFileFilterUsed(false);
         chooser.setFileFilter(new FileNameExtensionFilter("CSV files (*.csv)", "csv"));
@@ -330,19 +330,26 @@ public class ClientGUI extends JFrame {
             return;
         }
         loadCsvButton.setEnabled(false);
+        submitButton.setEnabled(false);
         loadCsvButton.setText("Loading...");
         jobExecutor.submit(() -> {
             try {
-                List<QueuedJob> loaded = CsvJobLoader.load(selected.toPath());
+                List<Long> loaded = CsvJobLoader.loadValues(selected.toPath());
                 SwingUtilities.invokeLater(() -> {
-                    for (QueuedJob job : loaded) {
-                        job.tableRow = queueTableModel.getRowCount();
-                        queuedJobs.add(job);
-                        queueTableModel.addRow(new Object[]{job.tableRow + 1, job.jobType,
-                                job.inputDescription(), job.status, job.result});
-                    }
-                    queueSummary.setText(queuedJobs.size() + " CSV job(s) loaded - Submit Queue to run pending jobs");
-                    log("Loaded " + loaded.size() + " job(s) from " + selected.getName() + ".");
+                    if (csvValues.isEmpty()) manualNumbersText = numbersField.getText();
+                    csvValues = loaded;
+                    csvFilename = selected.getName();
+                    numbersField.setEditable(false);
+                    numbersField.setText(loaded.subList(0, Math.min(8, loaded.size())).toString()
+                            + (loaded.size() > 8 ? " ..." : ""));
+                    String summary = String.format("%,d numbers loaded from %s - submitted together as one job",
+                            loaded.size(), selected.getName());
+                    datasetSummary.setText(summary);
+                    datasetSummary.setToolTipText(summary);
+                    String type = (String) jobTypeSelector.getSelectedItem();
+                    if (!"MAX".equals(type) && !"PRIMECOUNT".equals(type)) jobTypeSelector.setSelectedItem("MAX");
+                    updateInputMode();
+                    log(summary + ". Choose MAX or PRIMECOUNT, then Submit Job.");
                 });
             } catch (IOException | IllegalArgumentException error) {
                 SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(this,
@@ -350,25 +357,11 @@ public class ClientGUI extends JFrame {
             } finally {
                 SwingUtilities.invokeLater(() -> {
                     loadCsvButton.setEnabled(true);
+                    submitButton.setEnabled(true);
                     loadCsvButton.setText("Load CSV");
                 });
             }
         });
-    }
-
-    private void submitQueuedJobs() {
-        if (queuedJobs.isEmpty()) {
-            log("Load a CSV file before submitting the queue.");
-            return;
-        }
-        List<QueuedJob> pending = queuedJobs.stream()
-                .filter(job -> "Queued".equals(job.status))
-                .toList();
-        if (pending.isEmpty()) {
-            log("There are no queued jobs to submit.");
-            return;
-        }
-        pending.forEach(this::startJob);
     }
 
     private void startJob(QueuedJob job) {
@@ -421,13 +414,8 @@ public class ClientGUI extends JFrame {
     private void setQueueStatus(QueuedJob job, String status, String result) {
         job.status = status;
         job.result = result == null || result.isBlank() ? "—" : result;
-        if (job.tableRow >= 0) {
-            SwingUtilities.invokeLater(() -> {
-                queueTableModel.setValueAt(job.status, job.tableRow, 3);
-                queueTableModel.setValueAt(job.result, job.tableRow, 4);
-            });
-        }
     }
+
 
     static final class QueuedJob {
         final String jobType;
@@ -436,7 +424,6 @@ public class ClientGUI extends JFrame {
         final List<Long> values;
         volatile String status = "Queued";
         volatile String result = "—";
-        int tableRow = -1;
 
         private QueuedJob(String jobType, int start, int end, List<Long> values) {
             this.jobType = jobType;
@@ -454,7 +441,9 @@ public class ClientGUI extends JFrame {
         }
 
         String inputDescription() {
-            return values.isEmpty() ? start + " .. " + end : values.toString();
+            if (values.isEmpty()) return start + " .. " + end;
+            String preview = values.subList(0, Math.min(6, values.size())).toString();
+            return values.size() <= 6 ? preview : String.format("%,d numbers: %s ...", values.size(), preview);
         }
     }
 

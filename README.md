@@ -10,7 +10,7 @@ One checkout supports both operating systems; no alternate settings or source tr
 
 1. Install **JDK 24**, make `java` available on PATH, and install VS Code's **Code Runner** extension (`formulahendry.code-runner`). The shared build/run launcher checks `JAVA_HOME` and the current Java installation, then checks standard Windows JDK installation directories or macOS `/usr/libexec/java_home -v 24`. If JDK 24 is installed elsewhere, set `JAVA_HOME` to that folder. It sets the correct JDK for Maven even when the inherited `JAVA_HOME` points to an older JDK. Restart VS Code after environment changes.
 2. Extract the ZIP or pull the repository, then open the **a2** folder containing the root `pom.xml` and `.vscode`. Trust the folder after reviewing it.
-3. Build with **Ctrl+Shift+B** (Windows) or **Cmd+Shift+B** (macOS). Wait for **BUILD SUCCESS**. Initial Maven dependencies require internet access. Rebuild after changing Java or protobuf source.
+3. Build with **Ctrl+Shift+B** (Windows) or **Cmd+Shift+B** (macOS). Wait for **BUILD SUCCESS**. Initial Maven dependencies require internet access. Rebuild after changing Java or protobuf source. Automatic IDE compilation is disabled so the IDE and Maven do not overwrite each other's generated protobuf classes.
 4. Open `BootstrapNode.java` and click **Run Code**.
 5. Open `WorkerNode.java` and click **Run Code** three times, once for each worker.
 6. Open `ClientGUI.java` and click **Run Code**.
@@ -128,13 +128,16 @@ After starting bootstrap and at least three workers, launch the client:
 java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClientGUI
 ```
 
-The GUI supports SUM, PRIMESUM, MAX and PRIMECOUNT. Use **Load CSV** to open
-`sample_jobs.csv` from the repository root, then **Submit Queue**. List values
-remain unsorted and duplicate prime occurrences are counted individually. Manual
-Start/End input submits SUM/PRIMESUM ranges. Select MAX or PRIMECOUNT and type
-numbers in the **Numbers** field, separated by commas, spaces or semicolons.
-For example MAX(-9,-4,-21,-3) returns -3; PRIMECOUNT(2,3,3,4,5,5,5) returns 6.
-CSV's quoted `values` column also submits explicit lists.
+The GUI supports SUM, PRIMESUM, MAX and PRIMECOUNT. For a CSV dataset:
+
+1. Choose **MAX** or **PRIMECOUNT**.
+2. Click **Load CSV** and select `sample_values.csv` (100,000 unsorted numbers).
+3. Click **Submit Job**. Every number in the entire file belongs to this one job; the coordinator partitions it among workers.
+4. Compare the result with `sample_values_expected.txt`. Duplicate primes count separately.
+
+The CSV contains plain numbers separated by commas, optionally across multiple rows. There is no header, job type, start/end column, or separate job per row. The GUI shows a short preview and retains the complete dataset for submission. Switch job type to reuse the loaded data, or click **Use manual input** to return to typing numbers. SUM and PRIMESUM still use their Start/End range inputs. Loading the CSV selects MAX if a range job was selected.
+
+MAX can finish very quickly even on a large list; PRIMECOUNT performs more work. No artificial delay or invented progress is added. Loading and parsing happen on the existing background executor.
 Each job has its own measured progress bar; up to four client monitors run at once.
 Click a progress bar or the details button to expand the worker breakdown.
 Every monitor rediscovers and reconnects with its original request ID after failover.

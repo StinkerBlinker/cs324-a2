@@ -13,5 +13,6 @@
     ".demo": true,
     "**/target": true,
     "*.log": true
-  }
+  },
+  "java.autobuild.enabled": false
 }

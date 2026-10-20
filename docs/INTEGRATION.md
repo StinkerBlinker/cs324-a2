@@ -115,7 +115,7 @@ executor. WorkerService execute RPCs now run SUM/PRIMESUM/MAX/PRIMECOUNT; JobSer
 submission/progress. The old WorkerService SubmitJob remains UNIMPLEMENTED and
 is not used by the GUI. List values are carried through task partitioning and replicated checkpoints.
 MAX combines task maxima (including negative-only lists); PRIMECOUNT counts duplicate
-prime occurrences. CsvJobLoader and sample_jobs.csv feed concurrent GUI job rows.
+prime occurrences. CsvJobLoader reads every numeric cell in sample_values.csv into one dataset. Each explicit submission creates one GUI job row; CSV rows are not separate jobs.
 Worker details can be opened by clicking the progress bar or its details button.
 
 ## Remaining boundaries

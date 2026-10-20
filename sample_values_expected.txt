@@ -1,0 +1,10 @@
+Numeric CSV dataset: sample_values.csv
+Values: 100000
+CSV rows: 1000
+Values per row: 100
+MAX: 1000000009
+PRIMECOUNT: 65038
+
+All CSV rows belong to one dataset. Choose MAX or PRIMECOUNT, Load CSV, then Submit Job.
+Duplicates count separately. Row breaks only keep the file readable.
+MAX is inexpensive and can complete quickly; PRIMECOUNT does more computation.

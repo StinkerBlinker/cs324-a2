@@ -6,8 +6,8 @@ Validation completed on 20 October 2026 using JDK 24 and Maven 3.9.11.
 
 Command: `mvnw.cmd clean verify` (root reactor, Java 24).
 The restructured build contains four modules: common, bootstrap-node, client and worker-node.
-The application test suite contains 34 tests: IntegratedClusterTest (15),
-JobGrpcServiceImplTest (10), CsvJobLoaderTest (4), TaskProgressWatchTest (3),
+The application test suite contains 36 tests: IntegratedClusterTest (15),
+JobGrpcServiceImplTest (10), CsvJobLoaderTest (6), TaskProgressWatchTest (3),
 and WorkerLifecycleTest (2). The older six-test standalone election demo is
 archived outside this project and is not included in this total.
 The integration tests run actual localhost gRPC bootstrap and worker
@@ -48,8 +48,7 @@ servers; they do not replace bootstrap discovery with a static membership stub.
 The job-service tests cover numerical submission/progress, rejection by a
 non-coordinator, monotonic measured progress during normal execution, failed-worker
 task reassignment, list MAX/PRIMECOUNT and request-ID deduplication/rejection of
-changed inputs. The CSV tests cover range/list parsing, duplicate retention,
-quoted comma-separated values and invalid-row rejection.
+changed inputs. The CSV tests cover one numeric dataset across rows, duplicate/negative retention, quoted numeric cells, BOM handling, rejection of empty cells/job headers, and complete parsing of 100,000 values.
 
 ## Independent process demonstration
 
@@ -70,7 +69,7 @@ already-completed job before crash injection is rejected as an invalid demo.
 The latest restructured process logs are in `.demo/integrated-f15c9aff079a40c3a9779db74db9f923/`.
 
 The job service, measured streaming, checkpoint recovery and client reconnect
-path are integrated with PR #4 (fcfa3bb): CSV loading/sample_jobs.csv, MAX and
+path are integrated with PR #4 (fcfa3bb): numeric CSV loading/sample_values.csv, MAX and
 PRIMECOUNT list jobs, and multiple concurrent GUI progress rows. Each GUI job uses
 the tested reconnecting client. The Swing layout has not been visually exercised
 by this test suite.
@@ -83,3 +82,21 @@ task completes despite total duration exceeding its idle-timeout window; a stall
 stream is reported Slow then reassigned; and transport heartbeats cannot invent
 work progress. All four component projects compile with Java 24. Stale Eclipse metadata is excluded from the restructured source project. Aveshal's latest slow-worker
 commit (4f25b4e) is included in the resolved integration.
+
+## Large numeric CSV validation
+
+The numeric CSV is one dataset, not a list of jobs. `sample_values.csv` contains
+100,000 unsorted numbers over 1,000 rows. The live chooser check loaded all values
+on the background executor and confirmed one SubmitJobRequest retained every value
+while the GUI rendered only a short preview.
+
+A separate real gRPC cluster processed the entire dataset as one MAX job and
+returned 1000000009. A second single PRIMECOUNT job was interrupted by crashing
+its coordinator at 0.017% progress. The client reconnected and the replacement
+coordinator recovered the dataset and completed with the expected count 65038.
+Logs: `.demo` process logs are separate from `csv-dataset-cluster.log` for this
+in-process gRPC validation. The test used isolated bootstrap/worker servers.
+
+VS Code automatic compilation is disabled so Maven and the IDE do not mix generated
+class files. Protobuf generation preserves other proto outputs during incremental
+IDE generation; a clean Maven build still removes stale build products.
