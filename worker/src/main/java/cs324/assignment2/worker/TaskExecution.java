@@ -21,14 +21,36 @@ final class TaskExecution {
             out.onNext(ExecuteJobResponse.newBuilder().setTaskId(req.getTaskId()).setResult(result).build()); out.onCompleted();
         } catch (RuntimeException error) { fail(out,error); }
     }
-    static void stream(ExecuteJobRequest req, StreamObserver<ExecuteJobProgress> out) {
+    static void stream(ExecuteJobRequest req, StreamObserver<ExecuteJobProgress> out,
+                       java.util.concurrent.ScheduledExecutorService scheduler) {
+        Context call = Context.current();
+        var percentage = new java.util.concurrent.atomic.AtomicReference<>(0.0);
+        var partial = new java.util.concurrent.atomic.AtomicLong();
+        var ended = new java.util.concurrent.atomic.AtomicBoolean();
+        var heartbeat = scheduler.scheduleAtFixedRate(() -> {
+            synchronized (out) {
+                if (!ended.get() && !call.isCancelled()) out.onNext(ExecuteJobProgress.newBuilder()
+                        .setTaskId(req.getTaskId()).setCompletionPercentage(percentage.get())
+                        .setResult(partial.get()).setHeartbeat(true).build());
+            }
+        }, 1, 1, java.util.concurrent.TimeUnit.SECONDS);
         try {
             validate(req);
-            long result = calculate(req, (percentage,value) -> out.onNext(ExecuteJobProgress.newBuilder()
-                    .setTaskId(req.getTaskId()).setCompletionPercentage(percentage).setResult(value).build()));
-            out.onNext(ExecuteJobProgress.newBuilder().setTaskId(req.getTaskId()).setCompletionPercentage(100)
-                    .setResult(result).setIsFinished(true).build()); out.onCompleted();
-        } catch (RuntimeException error) { fail(out,error); }
+            long result = calculate(req, (done,value) -> {
+                synchronized (out) {
+                    percentage.set(done); partial.set(value);
+                    out.onNext(ExecuteJobProgress.newBuilder().setTaskId(req.getTaskId())
+                            .setCompletionPercentage(done).setResult(value).build());
+                }
+            });
+            synchronized (out) {
+                ended.set(true);
+                out.onNext(ExecuteJobProgress.newBuilder().setTaskId(req.getTaskId()).setCompletionPercentage(100)
+                        .setResult(result).setIsFinished(true).build()); out.onCompleted();
+            }
+        } catch (RuntimeException error) {
+            synchronized (out) { ended.set(true); if (!call.isCancelled()) fail(out,error); }
+        } finally { ended.set(true); heartbeat.cancel(false); }
     }
     private static long calculate(ExecuteJobRequest req, Progress progress) {
         boolean list=req.getValuesCount()>0;
@@ -52,7 +74,11 @@ final class TaskExecution {
         if(value%2==0)return value==2;
         if(value%3==0)return value==3;
         for(long divisor=5;divisor<=value/divisor;divisor+=6)
-            if(value%divisor==0 || value%(divisor+2)==0)return false;
+            {
+                if (Thread.currentThread().isInterrupted() || Context.current().isCancelled())
+                    throw new IllegalStateException("Worker computation cancelled");
+                if(value%divisor==0 || value%(divisor+2)==0)return false;
+            }
         return true;
     }
     private static void fail(StreamObserver<?> out, RuntimeException error) {

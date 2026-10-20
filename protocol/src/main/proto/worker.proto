@@ -100,6 +100,8 @@ message ExecuteJobProgress {
   int64 result = 3;
   bool is_finished = 4;
   string error_message = 5;
+  // Transport liveness only; never increments measured work.
+  bool heartbeat = 6;
 }
 
 message SubmitJobRequest {

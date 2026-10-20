@@ -1,7 +1,7 @@
 # CS324 Assignment 2
 
 This branch integrates Joshua's bootstrap/networking, Pranay's leader election
-and recovery, and Aveshal's job execution/streaming/GUI inside `cs324-A2`.
+and recovery, and Aveshal's job execution/streaming/GUI across separate Maven component projects.
 The original Assignment 1 ZIP/report remain at the repository root.
 
 ## Build
@@ -10,11 +10,26 @@ Use JDK 24 and the supplied Maven wrapper. In PowerShell at this repository root
 
 ```powershell
 $env:JAVA_HOME = 'C:\Program Files\Java\jdk-24'
-.\mvnw.cmd -f cs324-A2\pom.xml clean verify
+$env:Path = "$env:JAVA_HOME\bin;$env:Path"
+.\mvnw.cmd clean verify
 ```
 
 Adjust JAVA_HOME for your JDK location. The first build downloads dependencies.
-Output: `cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar`.
+The combined demo JAR remains `cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar`.
+
+| Project | Contents |
+|---|---|
+| `protocol/` | Shared .proto files and generated gRPC types |
+| `bootstrap/` | Registration, discovery and heartbeat expiry |
+| `client/` | GUI, CSV loader, coordinator discovery and reconnecting client |
+| `worker/` | Election, checkpoint recovery and threaded job execution |
+| `cs324-A2/` | Combined demo distribution; no duplicate application sources |
+| `election/` | Older standalone demonstration, kept separately |
+
+Client, bootstrap and worker each also produce their own executable classpath JAR
+under their project's `target/` directory. The commands below use the combined
+JAR for convenience; bootstrap, every worker and each GUI still run as separate
+Java processes.
 
 ## Start the integrated cluster
 
@@ -108,7 +123,10 @@ java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.client.Clie
 The GUI supports SUM, PRIMESUM, MAX and PRIMECOUNT. Use **Load CSV** to open
 `sample_jobs.csv` from the repository root, then **Submit Queue**. List values
 remain unsorted and duplicate prime occurrences are counted individually. Manual
-Start/End input submits a range; CSV's quoted `values` column submits explicit lists.
+Start/End input submits SUM/PRIMESUM ranges. Select MAX or PRIMECOUNT and type
+numbers in the **Numbers** field, separated by commas, spaces or semicolons.
+For example MAX(-9,-4,-21,-3) returns -3; PRIMECOUNT(2,3,3,4,5,5,5) returns 6.
+CSV's quoted `values` column also submits explicit lists.
 Each job has its own measured progress bar; up to four client monitors run at once.
 Click a progress bar or the details button to expand the worker breakdown.
 Every monitor rediscovers and reconnects with its original request ID after failover.
@@ -129,7 +147,7 @@ All processes must rebuild from the merged proto files: job submission uses
 `values = 4` and `request_id = 5`. Mixed older stubs are incompatible.
 The integrated runnable application is `cs324-A2`; `election/` is the older standalone
 demonstration with static membership stubs, and is not used by the integrated GUI.
-The root Maven build includes both modules.
+The root Maven build includes all component projects and the standalone demonstration.
 
 Bootstrap must remain available and retain its worker registry. Full-cluster/bootstrap
 restart recovery, TLS/authentication and replicated bootstrap are not implemented.
@@ -137,3 +155,16 @@ Checkpoint bytes are kept in worker RAM. Recovery deliberately stops if a majori
 of the PREVIOUS replica set is unavailable; shrinking the live registry does not
 make loss of acknowledged work acceptable. Do not claim arbitrary partition-safe
 consensus. End-to-end job recovery is verified under the documented crash model.
+
+## Active, slow and unavailable tasks
+
+Workers send task heartbeats once per second, separately from actual work updates.
+Heartbeats never increase completion percentage. Advancing measured work means
+Active. A reachable task without advancement for 10 seconds is shown as Slow.
+Five seconds without task heartbeat/progress means unreachable; 60 seconds without
+measured advancement means stalled. Unfinished work is reassigned. These are
+failure suspicions, not proof that a machine crashed. A task can run longer than
+60 seconds provided actual work continues advancing. Bootstrap independently
+expires worker registrations after missed heartbeats. The coordinator's checkpoint
+RPCs are independent of task-stream cancellation, and uncertain checkpoint writes
+are retried with the original job/task IDs.

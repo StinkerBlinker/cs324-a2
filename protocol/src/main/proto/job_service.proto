@@ -68,6 +68,7 @@ enum JobStatus {
   JOB_STATUS_COMPLETED = 3;
   JOB_STATUS_FAILED = 4;
   JOB_STATUS_CANCELLED = 5;
+  JOB_STATUS_SLOW = 6;
 }
 
 enum WorkerStatus {
@@ -86,6 +87,7 @@ enum SubTaskState {
   SUB_TASK_STATE_RUNNING = 2;
   SUB_TASK_STATE_COMPLETED = 3;
   SUB_TASK_STATE_FAILED = 4;
+  SUB_TASK_STATE_SLOW = 5;
 }
 
 // Replicated application state. Running attempts restart with new attempt IDs;

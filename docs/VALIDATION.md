@@ -1,13 +1,15 @@
 # Bootstrap and election integration validation
 
-Validation completed on 18 October 2026 using JDK 24 and Maven 3.9.11.
+Validation completed on 20 October 2026 using JDK 24 and Maven 3.9.11.
 
 ## Build and service integration tests
 
 Command: `mvnw.cmd clean verify` (root reactor, Java 24).
-The worker-owned election build passed. `IntegratedClusterTest` ran 14 tests, `JobGrpcServiceImplTest` ran 7 tests and
-`CsvJobLoaderTest` ran 3 tests: 24 integrated-application tests. The standalone
-`election/` module adds 6 tests: 30 total, zero failures, errors or skipped tests. The integration tests run actual localhost gRPC bootstrap and worker
+The component build passed. `IntegratedClusterTest` ran 15 tests,
+`JobGrpcServiceImplTest` ran 9 tests, `CsvJobLoaderTest` ran 4 tests and
+`TaskProgressWatchTest` ran 3 tests: 31 application tests. The standalone
+`election/` module adds 6 tests: 37 total, zero failures, errors or skipped tests.
+The integration tests run actual localhost gRPC bootstrap and worker
 servers; they do not replace bootstrap discovery with a static membership stub.
 
 1. Registration/discovery and neighbour links; lowest JAC and highest-ID tie-break.
@@ -64,7 +66,7 @@ force-kills the coordinator after the client observes completed tasks. The clien
 must rediscover the replacement and finish with the exact PRIMESUM result; an
 already-completed job before crash injection is rejected as an invalid demo.
 
-The latest process logs are in `.demo/integrated-6f664d0c6bef40938a34c3259b2b06d8/`.
+The latest process logs are in `.demo/integrated-9caad52482924140b561aa457142fbe0/`.
 
 The job service, measured streaming, checkpoint recovery and client reconnect
 path are integrated with PR #4 (fcfa3bb): CSV loading/sample_jobs.csv, MAX and
@@ -79,3 +81,11 @@ and waits for its replacement round before asserting readiness. This prevents an
 old ready state from satisfying the assertion before the injected election arrives.
 The integrated module passed `clean verify`; after this test synchronization fix,
 the standalone module was revalidated with `mvnw.cmd -pl election -am verify`.
+
+The final checks additionally cover manual list validation with negatives and
+duplicates; a real worker joins while PRIMESUM is being dispatched; a progressing
+task completes despite total duration exceeding its idle-timeout window; a stalled
+stream is reported Slow then reassigned; and transport heartbeats cannot invent
+work progress. All four component projects compile with Java 24. The legacy Eclipse
+compiler settings now match the Maven Java version. Aveshal's latest slow-worker
+commit (4f25b4e) is included in the resolved integration.

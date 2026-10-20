@@ -2,7 +2,9 @@
 
 ## Working code
 
-Use `cs324-A2` as the shared project. Networking, election and checkpoint recovery
+Build from the repository root. Shared protocol definitions are in `protocol/`;
+application sources are separated into `bootstrap/`, `client/` and `worker/`.
+`cs324-A2/` builds the combined demo distribution. Networking, election and checkpoint recovery
 run on the same worker server, using the existing `cs324.assignment2.grpc` types.
 No fixed worker-list stub is used. Existing worker election RPC names/field tags
 are retained; epochs and recovery messages are additional fields/methods.
@@ -135,3 +137,20 @@ these stubs must not be mixed with previous local builds. Every GUI monitor uses
 ResilientJobClient while keeping its own progress row. Four jobs can be monitored
 concurrently. Both the full original list and each partition's list values are
 retained in PersistedJob/PersistedTask for coordinator recovery.
+
+## Final component and monitoring integration
+
+Joshua's branch 85d13d7, Aveshal's branch including 4f25b4e, and the worker-owned
+election/recovery commits are combined. Aveshal's task heartbeat field (tag 6) and
+Slow job/worker/task statuses are retained. Heartbeats indicate transport liveness,
+not completed work. The hard total task deadline was replaced by separate silence
+and work-stall timeouts, so a progressing task is not failed simply for taking
+longer than 60 seconds. Failed or stalled attempts are reassigned rather than
+immediately failing the entire job. Control-plane checkpoints run outside the
+cancelled task context. Same-term uncertain checkpoint writes trigger reload and
+retry rather than leaving an acknowledged job permanently paused.
+
+Build all modules with `mvnw.cmd clean verify`; do not build only the distribution
+POM before its component dependencies. Each runtime component has its own project
+and JAR. The combined demo JAR and process launch class names remain unchanged.
+Manual MAX/PRIMECOUNT list input now accompanies CSV input in the GUI.

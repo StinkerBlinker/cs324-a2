@@ -243,12 +243,15 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
         }
 
         io.grpc.Context.CancellableContext context = io.grpc.Context.ROOT.withCancellation();
-        TaskProgressWatch watch = new TaskProgressWatch(System::nanoTime, slowMs, stalledMs);
+        TaskProgressWatch watch = new TaskProgressWatch(System::nanoTime, slowMs, stalledMs, Math.min(5_000, stalledMs));
         var finished = new java.util.concurrent.atomic.AtomicBoolean();
         var alarm = taskMonitor.scheduleWithFixedDelay(() -> {
             if (finished.get()) return;
-            if (watch.state() == TaskProgressWatch.State.STALLED && finished.compareAndSet(false, true)) {
-                handleWorkerFailure(job, attempt, "No increase in measured work for " + stalledMs + " ms; retrying stalled task");
+            TaskProgressWatch.State health = watch.state();
+            if ((health == TaskProgressWatch.State.STALLED || health == TaskProgressWatch.State.UNREACHABLE) && finished.compareAndSet(false, true)) {
+                String reason = health == TaskProgressWatch.State.UNREACHABLE ? "No task heartbeat/progress received"
+                        : "No increase in measured work for " + stalledMs + " ms";
+                handleWorkerFailure(job, attempt, reason + "; retrying unfinished task");
                 context.cancel(Status.DEADLINE_EXCEEDED.withDescription("Task stalled").asRuntimeException());
             } else if (watch.state() == TaskProgressWatch.State.SLOW) job.markSlow(attempt);
         }, Math.min(500, slowMs), Math.min(500, slowMs), TimeUnit.MILLISECONDS);
@@ -263,6 +266,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                     new StreamObserver<ExecuteJobProgress>() {
                         @Override public void onNext(ExecuteJobProgress update) {
                             if (finished.get()) return;
+                            if (update.getHeartbeat()) { watch.heartbeat(); return; }
                             watch.advance(update.getCompletionPercentage());
                             if (!update.getErrorMessage().isEmpty()) {
                                 finished.set(true); alarm.cancel(false);
@@ -538,7 +542,9 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             }
             task.completionPercentage = Math.max(0.0, Math.min(100.0, percentage));
             task.workerStatus = WorkerStatus.WORKER_STATUS_ACTIVE;
+            task.state = SubTaskState.SUB_TASK_STATE_RUNNING;
             task.message = "Executing";
+            updateTerminalStatus();
             task.result = result;
             publish(false);
         }
@@ -547,6 +553,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             TaskProgress task = tasks.get(attempt.task.taskId);
             if (isTerminal() || !isCurrentAttempt(task, attempt) || task.workerStatus == WorkerStatus.WORKER_STATUS_SLOW) return;
             task.workerStatus = WorkerStatus.WORKER_STATUS_SLOW;
+            task.state = SubTaskState.SUB_TASK_STATE_SLOW;
+            status = JobStatus.JOB_STATUS_SLOW;
             task.message = "Slow: waiting for measured work to advance";
             publish(false);
         }
@@ -606,7 +614,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
 
         private boolean isCurrentAttempt(TaskProgress task, TaskAttempt attempt) {
             return task != null
-                    && task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                    && (task.state == SubTaskState.SUB_TASK_STATE_RUNNING || task.state == SubTaskState.SUB_TASK_STATE_SLOW)
                     && task.attemptNumber == attempt.attemptNumber
                     && task.worker != null
                     && task.worker.getId() == attempt.worker.getId();
@@ -636,7 +644,8 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
             failIfNoWorkersCanContinueLocked();
             boolean allTerminal = tasks.values().stream().allMatch(task -> isTaskTerminal(task.state));
             if (!allTerminal) {
-                status = JobStatus.JOB_STATUS_RUNNING;
+                status = tasks.values().stream().anyMatch(t -> t.state == SubTaskState.SUB_TASK_STATE_SLOW)
+                        ? JobStatus.JOB_STATUS_SLOW : JobStatus.JOB_STATUS_RUNNING;
                 return;
             }
             boolean failed = tasks.values().stream()
@@ -679,7 +688,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                 completedWork += task.totalWork * task.completionPercentage / 100.0;
                 if ("MAX".equals(jobType)) {
                     if (task.state == SubTaskState.SUB_TASK_STATE_COMPLETED
-                            || task.state == SubTaskState.SUB_TASK_STATE_RUNNING
+                            || (task.state == SubTaskState.SUB_TASK_STATE_RUNNING || task.state == SubTaskState.SUB_TASK_STATE_SLOW)
                             && task.completionPercentage > 0.0) {
                         totalResult = Math.max(totalResult, task.result);
                         hasMaximum = true;
@@ -693,7 +702,7 @@ public final class JobGrpcServiceImpl extends JobServiceGrpc.JobServiceImplBase
                             .setStatus(task.workerStatus)
                             .setCompletionPercentage(task.completionPercentage)
                             .setActiveSubTaskCount(
-                                    task.state == SubTaskState.SUB_TASK_STATE_RUNNING ? 1 : 0)
+                                    task.state == SubTaskState.SUB_TASK_STATE_RUNNING || task.state == SubTaskState.SUB_TASK_STATE_SLOW ? 1 : 0)
                             .setCompletedSubTaskCount(
                                     task.state == SubTaskState.SUB_TASK_STATE_COMPLETED ? 1 : 0)
                             .setStatusMessage(task.message));

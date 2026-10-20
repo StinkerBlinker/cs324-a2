@@ -29,6 +29,9 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
     private final WorkerElectionMetadata electionMetadata = new WorkerElectionMetadata(this);
     private final JobGrpcServiceImpl jobGrpcService = new JobGrpcServiceImpl(this);
     private final ExecutorService jobPool = Executors.newCachedThreadPool();
+    private final ScheduledExecutorService taskHeartbeats = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread thread = new Thread(r, "task-heartbeat"); thread.setDaemon(true); return thread;
+    });
 
     public WorkerNode() { this("localhost", 50051, 0, 0); }
     public WorkerNode(String bootstrapHost, int bootstrapPort, int listenPort, int initialJac) {
@@ -184,7 +187,12 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
         jobPool.execute(Context.current().wrap(() -> TaskExecution.execute(req, out)));
     }
     @Override public void executeJobWithProgress(ExecuteJobRequest req, StreamObserver<ExecuteJobProgress> out) {
-        jobPool.execute(Context.current().wrap(() -> TaskExecution.stream(req, out)));
+        var observer = (io.grpc.stub.ServerCallStreamObserver<ExecuteJobProgress>) out;
+        var task = new AtomicReference<Future<?>>();
+        observer.setOnCancelHandler(() -> { Future<?> running = task.get(); if (running != null) running.cancel(true); });
+        Future<?> running = jobPool.submit(Context.current().wrap(() -> TaskExecution.stream(req, out, taskHeartbeats)));
+        task.set(running);
+        if (observer.isCancelled()) running.cancel(true);
     }
     @Override public void submitJob(SubmitJobRequest req, StreamObserver<JobProgressUpdate> out) {
         out.onError(Status.UNIMPLEMENTED.withDescription("Job submission/progress awaits job-engine integration").asRuntimeException());
@@ -217,7 +225,7 @@ public class WorkerNode extends WorkerServiceGrpc.WorkerServiceImplBase implemen
         if (deregister && id > 0) try { bootstrap().deregisterWorker(DeregisterWorkerRequest.newBuilder().setWorkerId(id).build()); }
         catch (StatusRuntimeException ignored) { }
         if (server != null) server.shutdownNow();
-        jobGrpcService.close(); jobPool.shutdownNow();
+        jobGrpcService.close(); jobPool.shutdownNow(); taskHeartbeats.shutdownNow();
         floodPool.shutdownNow(); channels.values().forEach(ManagedChannel::shutdownNow);
         if (bootstrapChannel != null) bootstrapChannel.shutdownNow();
     }

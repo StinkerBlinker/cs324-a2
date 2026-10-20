@@ -2,7 +2,7 @@ param([switch]$RealJob)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $demoJar = Join-Path $projectRoot 'cs324-A2\target\cs324-A2-1.0-SNAPSHOT.jar'
-if (-not (Test-Path -LiteralPath $demoJar)) { throw 'Build first: .\mvnw.cmd -f cs324-A2\pom.xml clean verify' }
+if (-not (Test-Path -LiteralPath $demoJar)) { throw 'Build first: .\mvnw.cmd clean verify' }
 $demoLogDir = Join-Path $projectRoot ('.demo\integrated-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $demoLogDir -Force | Out-Null
 $javaPath = (Get-Command java).Source

@@ -27,4 +27,15 @@ class TaskProgressWatchTest {
         watch.advance(26);
         assertEquals(TaskProgressWatch.State.ACTIVE, watch.state());
     }
+    @Test void heartbeatsProveReachabilityWithoutInventingWork() {
+        AtomicLong clock = new AtomicLong();
+        TaskProgressWatch watch = new TaskProgressWatch(clock::get, 10, 60, 5);
+        watch.advance(25);
+        clock.set(TimeUnit.MILLISECONDS.toNanos(15)); watch.heartbeat();
+        assertEquals(TaskProgressWatch.State.SLOW, watch.state());
+        clock.set(TimeUnit.MILLISECONDS.toNanos(61)); watch.heartbeat();
+        assertEquals(TaskProgressWatch.State.STALLED, watch.state());
+        clock.set(TimeUnit.MILLISECONDS.toNanos(67));
+        assertEquals(TaskProgressWatch.State.UNREACHABLE, watch.state());
+    }
 }
