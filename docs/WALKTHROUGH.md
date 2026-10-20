@@ -7,28 +7,28 @@ each client run in separate Java processes. Source projects remain separate.
 
 ## Follow the code
 
-1. `worker/.../WorkerNode.java`: `start()` creates the gRPC server, registers with
+1. `worker-node/.../WorkerNode.java`: `start()` creates the gRPC server, registers with
    bootstrap, attaches to a random neighbour, and schedules heartbeats/monitoring.
-   `bootstrap/.../BootstrapServiceImpl.java` assigns IDs and expires silent workers.
-2. `worker/.../WorkerElectionMetadata.java`: `begin()` prepares a numbered election
+   `bootstrap-node/.../BootstrapServiceImpl.java` assigns IDs and expires silent workers.
+2. `worker-node/.../WorkerElectionMetadata.java`: `begin()` prepares a numbered election
    round. The lowest active ID serializes round proposals. It is not automatically
    the coordinator. Workers retain the previous ready replica group for recovery.
-3. `worker/.../ElectionRecovery.java`: `receiveElection()` processes a round once
+3. `worker-node/.../ElectionRecovery.java`: `receiveElection()` processes a round once
    and floods neighbours. Candidacy reaches the initiator. `conclude()` waits for
    all current candidates, then picks lowest JAC, breaking ties by highest ID.
    The coordinator announcement is flooded. `recover()` restores checkpoints
    before the elected worker is allowed to serve jobs.
-4. `worker/.../JobGrpcServiceImpl.java`: `submitJob()` validates/stores the request,
+4. `worker-node/.../JobGrpcServiceImpl.java`: `submitJob()` validates/stores the request,
    partitions ranges/lists, and schedules tasks. `persist()` checkpoints admission,
    assignment and completed results before publication. The same request ID refers
    to the same logical job. `ensureRecovered()` retains completed results and
    restarts unfinished attempts after a coordinator change.
-5. `worker/.../TaskExecution.java`: numerical loops produce measured percentages.
+5. `worker-node/.../TaskExecution.java`: numerical loops produce measured percentages.
    Separate heartbeat messages prove transport liveness without increasing work.
    `TaskProgressWatch.java` distinguishes advancing, slow, silent and stalled tasks.
 6. `client/.../ClientGUI.java`: each manual/CSV job gets its own progress row.
    `ResilientJobClient.java` discovers workers and reconnects using the original
-   request ID after an unavailable coordinator. `protocol/src/main/proto/` defines
+   request ID after an unavailable coordinator. `common/src/main/proto/` defines
    every distributed message and RPC.
 
 ## Explain epochs and quorums in the demo

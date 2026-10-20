@@ -4,8 +4,10 @@
   <modelVersion>4.0.0</modelVersion>
   <groupId>fj.usp.cs324</groupId><artifactId>cs324-a2</artifactId><version>1.0-SNAPSHOT</version><packaging>pom</packaging>
   <modules>
-    <module>protocol</module><module>bootstrap</module><module>client</module>
-    <module>worker</module><module>cs324-A2</module><module>election</module>
+    <module>common</module>
+    <module>bootstrap-node</module>
+    <module>client</module>
+    <module>worker-node</module>
   </modules>
   <properties>
     <maven.compiler.release>24</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

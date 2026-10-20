@@ -2,9 +2,9 @@
 
 ## Working code
 
-Build from the repository root. Shared protocol definitions are in `protocol/`;
-application sources are separated into `bootstrap/`, `client/` and `worker/`.
-`cs324-A2/` builds the combined demo distribution. Networking, election and checkpoint recovery
+Build from the repository root. Shared protocol definitions are in `common/`;
+application sources are separated into `bootstrap-node/`, `client/` and `worker-node/`.
+Each application module builds its own JAR with runtime dependencies. Networking, election and checkpoint recovery
 run on the same worker server, using the existing `cs324.assignment2.grpc` types.
 No fixed worker-list stub is used. Existing worker election RPC names/field tags
 are retained; epochs and recovery messages are additional fields/methods.
@@ -142,7 +142,7 @@ retained in PersistedJob/PersistedTask for coordinator recovery.
 
 Joshua's branch 85d13d7, Aveshal's branch including 4f25b4e, and the worker-owned
 election/recovery commits are combined. Aveshal's task heartbeat field (tag 6) and
-Slow job/worker/task statuses are retained. Heartbeats indicate transport liveness,
+Slow job/worker-node/task statuses are retained. Heartbeats indicate transport liveness,
 not completed work. The hard total task deadline was replaced by separate silence
 and work-stall timeouts, so a progressing task is not failed simply for taking
 longer than 60 seconds. Failed or stalled attempts are reassigned rather than

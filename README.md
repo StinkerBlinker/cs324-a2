@@ -1,8 +1,21 @@
 # CS324 Assignment 2
 
-This branch integrates Joshua's bootstrap/networking, Pranay's leader election
+This branch integrates Joshua's bootstrap-node/networking, Pranay's leader election
 and recovery, and Aveshal's job execution/streaming/GUI across separate Maven component projects.
-The original Assignment 1 ZIP/report remain at the repository root.
+Historical project files are kept outside the active project in a local backup.
+
+## Run Code in VS Code (Windows and macOS)
+
+One checkout supports both operating systems; no alternate settings or source tree is needed.
+
+1. Install **JDK 24**, make `java` available on PATH, and install VS Code's **Code Runner** extension (`formulahendry.code-runner`). The shared build/run launcher checks `JAVA_HOME` and the current Java installation, then checks standard Windows JDK installation directories or macOS `/usr/libexec/java_home -v 24`. If JDK 24 is installed elsewhere, set `JAVA_HOME` to that folder. It sets the correct JDK for Maven even when the inherited `JAVA_HOME` points to an older JDK. Restart VS Code after environment changes.
+2. Extract the ZIP or pull the repository, then open the **a2** folder containing the root `pom.xml` and `.vscode`. Trust the folder after reviewing it.
+3. Build with **Ctrl+Shift+B** (Windows) or **Cmd+Shift+B** (macOS). Wait for **BUILD SUCCESS**. Initial Maven dependencies require internet access. Rebuild after changing Java or protobuf source.
+4. Open `BootstrapNode.java` and click **Run Code**.
+5. Open `WorkerNode.java` and click **Run Code** three times, once for each worker.
+6. Open `ClientGUI.java` and click **Run Code**.
+
+Every click launches only the selected component in its own process. Windows opens a PowerShell console that stays open after the component exits and saves its output under `.demo/launch/`; macOS opens a Terminal session (allow VS Code to control Terminal if prompted). Stop bootstrap/workers with Ctrl+C in their respective windows. `.vscode/RunComponent.java` is a source-mode Java launcher that chooses the OS and JDK; it does not modify the application. Supporting classes without a main method cannot be run independently. All team members use the same files and the same Run Code buttons.
 
 ## Build
 
@@ -15,34 +28,29 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 ```
 
 Adjust JAVA_HOME for your JDK location. The first build downloads dependencies.
-The combined demo JAR remains `cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar`.
+The parent builds four modules, each with its own POM:
 
 | Project | Contents |
 |---|---|
-| `protocol/` | Shared .proto files and generated gRPC types |
-| `bootstrap/` | Registration, discovery and heartbeat expiry |
-| `client/` | GUI, CSV loader, coordinator discovery and reconnecting client |
-| `worker/` | Election, checkpoint recovery and threaded job execution |
-| `cs324-A2/` | Combined demo distribution; no duplicate application sources |
-| `election/` | Older standalone demonstration, kept separately |
+| `common/` | Shared .proto definitions and generated gRPC classes |
+| `bootstrap-node/` | Registration, discovery and heartbeat expiry |
+| `worker-node/` | Election, checkpoint recovery and job execution |
+| `client/` | GUI, CSV loader, reconnecting client and diagnostic CLI |
 
-Client, bootstrap and worker each also produce their own executable classpath JAR
-under their project's `target/` directory. The commands below use the combined
-JAR for convenience; bootstrap, every worker and each GUI still run as separate
-Java processes.
+Bootstrap, worker and client each produce a JAR containing their runtime dependencies under their own `target/` folder. They run as separate Java processes. There are five POM files in total, including the root parent. The old standalone election demo and combined packaging module are no longer part of this project.
 
 ## Start the integrated cluster
 
 Open four VS Code terminals at the repository root. Start bootstrap first:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.bootstrap.BootstrapNode
+java -cp bootstrap-node/target/bootstrap-node-1.0-SNAPSHOT.jar cs324.assignment2.bootstrap.BootstrapNode
 ```
 
 In each of the other three terminals run:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.WorkerNode
+java -cp worker-node/target/worker-node-1.0-SNAPSHOT.jar cs324.assignment2.worker.WorkerNode
 ```
 
 Workers receive unique IDs from bootstrap, bind free ports, choose random
@@ -55,7 +63,7 @@ LISTEN_PORT INITIAL_JAC`. Defaults are localhost, bootstrap port 50051, an
 automatically assigned worker port and JAC zero. Example with a fixed worker port:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.WorkerNode localhost 50051 5101 0
+java -cp worker-node/target/worker-node-1.0-SNAPSHOT.jar cs324.assignment2.worker.WorkerNode localhost 50051 5101 0
 ```
 
 ## Observe and demonstrate recovery
@@ -64,8 +72,8 @@ Use another terminal. These CLI calls discover the leader through the real
 bootstrap, without a static worker list:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.ClusterDemo status
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.ClusterDemo checkpoint localhost 50051 job-42 'input=1..100;task-A=done;task-B=pending'
+java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClusterDemo status
+java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClusterDemo checkpoint localhost 50051 job-42 'input=1..100;task-A=done;task-B=pending'
 ```
 
 Expect `CHECKPOINT_ACCEPTED=true`. Close/kill only the worker 3 process. A force
@@ -73,8 +81,8 @@ kill demonstrates bootstrap timeout detection; Ctrl+C uses clean deregistration.
 After election/recovery, query again:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.ClusterDemo status
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.ClusterDemo read
+java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClusterDemo status
+java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClusterDemo read
 ```
 
 Expect coordinator 2, `READY=true`, and the saved payload. Start another worker
@@ -109,7 +117,7 @@ It stops only the processes it started and leaves logs under `.demo/`.
   pooled channels, deadlines and shutdown cleanup.
 * `ElectionRecovery`: duplicate-suppressed flooding, complete candidate collection,
   JAC selection, coordinator checks, replica recovery and job admission deduplication.
-* `IntegratedClusterTest`: actual localhost gRPC tests using real bootstrap/workers.
+* `IntegratedClusterTest`: actual localhost gRPC tests using real bootstrap-node/workers.
 * `docs/INTEGRATION.md`: contracts for Aveshal and the exact recovery assumptions.
 
 ## Run jobs and the GUI
@@ -117,7 +125,7 @@ It stops only the processes it started and leaves logs under `.demo/`.
 After starting bootstrap and at least three workers, launch the client:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.client.ClientGUI
+java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClientGUI
 ```
 
 The GUI supports SUM, PRIMESUM, MAX and PRIMECOUNT. Use **Load CSV** to open
@@ -133,7 +141,7 @@ Every monitor rediscovers and reconnects with its original request ID after fail
 For a command-line computation with the same reconnect behaviour:
 
 ```powershell
-java -cp cs324-A2/target/cs324-A2-1.0-SNAPSHOT.jar cs324.assignment2.worker.ClusterDemo job localhost 50051 PRIMESUM 1 50 demo-primes
+java -cp client/target/client-1.0-SNAPSHOT.jar cs324.assignment2.client.ClusterDemo job localhost 50051 PRIMESUM 1 50 demo-primes
 ```
 
 Expected result: 328. Reusing `demo-primes` retrieves that same logical job; use
@@ -145,9 +153,7 @@ attempt identities. Partial in-flight progress can decrease when work is retried
 The old WorkerService SubmitJob RPC remains UNIMPLEMENTED; the GUI uses JobService.
 All processes must rebuild from the merged proto files: job submission uses
 `values = 4` and `request_id = 5`. Mixed older stubs are incompatible.
-The integrated runnable application is `cs324-A2`; `election/` is the older standalone
-demonstration with static membership stubs, and is not used by the integrated GUI.
-The root Maven build includes all component projects and the standalone demonstration.
+The root Maven build includes only the four component modules.
 
 Bootstrap must remain available and retain its worker registry. Full-cluster/bootstrap
 restart recovery, TLS/authentication and replicated bootstrap are not implemented.

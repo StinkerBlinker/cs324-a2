@@ -1,8 +1,9 @@
 param([switch]$RealJob)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$demoJar = Join-Path $projectRoot 'cs324-A2\target\cs324-A2-1.0-SNAPSHOT.jar'
-if (-not (Test-Path -LiteralPath $demoJar)) { throw 'Build first: .\mvnw.cmd clean verify' }
+$componentJars = @('bootstrap-node', 'worker-node', 'client') | ForEach-Object { Join-Path $projectRoot "$_/target/$_-1.0-SNAPSHOT.jar" }
+$demoJar = $componentJars -join [IO.Path]::PathSeparator
+if (@($componentJars | Where-Object { -not (Test-Path -LiteralPath $_) }).Count -gt 0) { throw 'Build first: .\mvnw.cmd clean verify' }
 $demoLogDir = Join-Path $projectRoot ('.demo\integrated-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $demoLogDir -Force | Out-Null
 $javaPath = (Get-Command java).Source
@@ -21,7 +22,7 @@ function Invoke-Cluster([string[]]$clientArgs) {
     $previousPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $output = & $javaPath -cp $demoJar cs324.assignment2.worker.ClusterDemo @clientArgs 2>> (Join-Path $demoLogDir 'client.err.log')
+        $output = & $javaPath -cp $demoJar cs324.assignment2.client.ClusterDemo @clientArgs 2>> (Join-Path $demoLogDir 'client.err.log')
         $script:clientExitCode = $LASTEXITCODE
         return $output
     } finally { $ErrorActionPreference = $previousPreference }
@@ -78,7 +79,7 @@ try {
     if ($script:clientExitCode -ne 0 -or ($saved -join '') -notmatch 'CHECKPOINT_ACCEPTED=true') { throw 'Checkpoint replication failed' }
     $realJobProcess = $null
     if ($RealJob) {
-        $realJobProcess = Start-ClusterProcess -name 'real-job' -className 'cs324.assignment2.worker.ClusterDemo' `
+        $realJobProcess = Start-ClusterProcess -name 'real-job' -className 'cs324.assignment2.client.ClusterDemo' `
             -programArgs @('job', 'localhost', "$bootstrapPort", 'PRIMESUM', '1', '2000000', 'process-primes')
         $deadline = [DateTime]::UtcNow.AddSeconds(30)
         do {

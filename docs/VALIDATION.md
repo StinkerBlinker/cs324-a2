@@ -5,10 +5,11 @@ Validation completed on 20 October 2026 using JDK 24 and Maven 3.9.11.
 ## Build and service integration tests
 
 Command: `mvnw.cmd clean verify` (root reactor, Java 24).
-The component build passed. `IntegratedClusterTest` ran 15 tests,
-`JobGrpcServiceImplTest` ran 9 tests, `CsvJobLoaderTest` ran 4 tests and
-`TaskProgressWatchTest` ran 3 tests: 31 application tests. The standalone
-`election/` module adds 6 tests: 37 total, zero failures, errors or skipped tests.
+The restructured build contains four modules: common, bootstrap-node, client and worker-node.
+The application test suite contains 34 tests: IntegratedClusterTest (15),
+JobGrpcServiceImplTest (10), CsvJobLoaderTest (4), TaskProgressWatchTest (3),
+and WorkerLifecycleTest (2). The older six-test standalone election demo is
+archived outside this project and is not included in this total.
 The integration tests run actual localhost gRPC bootstrap and worker
 servers; they do not replace bootstrap discovery with a static membership stub.
 
@@ -44,10 +45,10 @@ servers; they do not replace bootstrap discovery with a static membership stub.
     After the coordinator crashes, the same request IDs recover the same results;
     original list order, duplicates and partition inputs remain in replicated state.
 
-The seven job-service tests cover numerical submission/progress, rejection by a
+The job-service tests cover numerical submission/progress, rejection by a
 non-coordinator, monotonic measured progress during normal execution, failed-worker
 task reassignment, list MAX/PRIMECOUNT and request-ID deduplication/rejection of
-changed inputs. Three CSV tests cover range/list parsing, duplicate retention,
+changed inputs. The CSV tests cover range/list parsing, duplicate retention,
 quoted comma-separated values and invalid-row rejection.
 
 ## Independent process demonstration
@@ -66,26 +67,19 @@ force-kills the coordinator after the client observes completed tasks. The clien
 must rediscover the replacement and finish with the exact PRIMESUM result; an
 already-completed job before crash injection is rejected as an invalid demo.
 
-The latest process logs are in `.demo/integrated-9caad52482924140b561aa457142fbe0/`.
+The latest restructured process logs are in `.demo/integrated-f15c9aff079a40c3a9779db74db9f923/`.
 
 The job service, measured streaming, checkpoint recovery and client reconnect
 path are integrated with PR #4 (fcfa3bb): CSV loading/sample_jobs.csv, MAX and
 PRIMECOUNT list jobs, and multiple concurrent GUI progress rows. Each GUI job uses
 the tested reconnecting client. The Swing layout has not been visually exercised
 by this test suite.
-The earlier Word report describes the standalone module; its protocol/state details
+The earlier Word report describes the standalone module; its common/state details
 must be updated to this integrated version before the final report is assembled.
-
-The standalone initiator-crash test now observes the injected round at a survivor
-and waits for its replacement round before asserting readiness. This prevents an
-old ready state from satisfying the assertion before the injected election arrives.
-The integrated module passed `clean verify`; after this test synchronization fix,
-the standalone module was revalidated with `mvnw.cmd -pl election -am verify`.
 
 The final checks additionally cover manual list validation with negatives and
 duplicates; a real worker joins while PRIMESUM is being dispatched; a progressing
 task completes despite total duration exceeding its idle-timeout window; a stalled
 stream is reported Slow then reassigned; and transport heartbeats cannot invent
-work progress. All four component projects compile with Java 24. The legacy Eclipse
-compiler settings now match the Maven Java version. Aveshal's latest slow-worker
+work progress. All four component projects compile with Java 24. Stale Eclipse metadata is excluded from the restructured source project. Aveshal's latest slow-worker
 commit (4f25b4e) is included in the resolved integration.

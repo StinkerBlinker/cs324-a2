@@ -1,0 +1,115 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "name": "1 Bootstrap",
+      "request": "launch",
+      "mainClass": "cs324.assignment2.bootstrap.BootstrapNode",
+      "args": [],
+      "classPaths": [
+        "${workspaceFolder}/bootstrap-node/target/bootstrap-node-1.0-SNAPSHOT.jar"
+      ],
+      "sourcePaths": [
+        "${workspaceFolder}/worker-node/src/main/java",
+        "${workspaceFolder}/client/src/main/java",
+        "${workspaceFolder}/bootstrap-node/src/main/java",
+        "${workspaceFolder}/common/src/main/java"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "javaExec": "${env:JAVA_HOME}/bin/java.exe"
+    },
+    {
+      "type": "java",
+      "name": "2 Worker one",
+      "request": "launch",
+      "mainClass": "cs324.assignment2.worker.WorkerNode",
+      "args": [
+        "localhost",
+        "50051",
+        "0",
+        "0"
+      ],
+      "classPaths": [
+        "${workspaceFolder}/worker-node/target/worker-node-1.0-SNAPSHOT.jar"
+      ],
+      "sourcePaths": [
+        "${workspaceFolder}/worker-node/src/main/java",
+        "${workspaceFolder}/client/src/main/java",
+        "${workspaceFolder}/bootstrap-node/src/main/java",
+        "${workspaceFolder}/common/src/main/java"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "javaExec": "${env:JAVA_HOME}/bin/java.exe"
+    },
+    {
+      "type": "java",
+      "name": "3 Worker two",
+      "request": "launch",
+      "mainClass": "cs324.assignment2.worker.WorkerNode",
+      "args": [
+        "localhost",
+        "50051",
+        "0",
+        "0"
+      ],
+      "classPaths": [
+        "${workspaceFolder}/worker-node/target/worker-node-1.0-SNAPSHOT.jar"
+      ],
+      "sourcePaths": [
+        "${workspaceFolder}/worker-node/src/main/java",
+        "${workspaceFolder}/client/src/main/java",
+        "${workspaceFolder}/bootstrap-node/src/main/java",
+        "${workspaceFolder}/common/src/main/java"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "javaExec": "${env:JAVA_HOME}/bin/java.exe"
+    },
+    {
+      "type": "java",
+      "name": "4 Worker three",
+      "request": "launch",
+      "mainClass": "cs324.assignment2.worker.WorkerNode",
+      "args": [
+        "localhost",
+        "50051",
+        "0",
+        "0"
+      ],
+      "classPaths": [
+        "${workspaceFolder}/worker-node/target/worker-node-1.0-SNAPSHOT.jar"
+      ],
+      "sourcePaths": [
+        "${workspaceFolder}/worker-node/src/main/java",
+        "${workspaceFolder}/client/src/main/java",
+        "${workspaceFolder}/bootstrap-node/src/main/java",
+        "${workspaceFolder}/common/src/main/java"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "javaExec": "${env:JAVA_HOME}/bin/java.exe"
+    },
+    {
+      "type": "java",
+      "name": "5 Client GUI",
+      "request": "launch",
+      "mainClass": "cs324.assignment2.client.ClientGUI",
+      "args": [],
+      "classPaths": [
+        "${workspaceFolder}/client/target/client-1.0-SNAPSHOT.jar"
+      ],
+      "sourcePaths": [
+        "${workspaceFolder}/worker-node/src/main/java",
+        "${workspaceFolder}/client/src/main/java",
+        "${workspaceFolder}/bootstrap-node/src/main/java",
+        "${workspaceFolder}/common/src/main/java"
+      ],
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "javaExec": "${env:JAVA_HOME}/bin/java.exe"
+    }
+  ]
+}

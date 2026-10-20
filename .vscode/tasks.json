@@ -1,0 +1,45 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build application with Java 24",
+      "type": "process",
+      "command": "java",
+      "args": [
+        "${workspaceFolder}/.vscode/RunComponent.java",
+        "--build",
+        "${workspaceFolder}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$javac"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "Verify all tests with Java 24",
+      "type": "process",
+      "command": "java",
+      "args": [
+        "${workspaceFolder}/.vscode/RunComponent.java",
+        "--verify",
+        "${workspaceFolder}"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [
+        "$javac"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    }
+  ]
+}
