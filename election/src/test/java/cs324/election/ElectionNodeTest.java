@@ -96,8 +96,13 @@ class ElectionNodeTest {
         nodes.get(4).close(); agree(4, 1, 2, 3, 4);
         assertEquals("result=328", nodes.get(3).snapshot().getRecords(0).getPayload().toStringUtf8());
         nodes.get(0).startElection();
+        Round abandoned = nodes.get(0).status().getRound();
+        // Observe delivery before killing the initiator. Otherwise agree() can
+        // see the previous ready leader before this election reaches survivors.
+        await(() -> ElectionNode.compare(nodes.get(3).status().getRound(), abandoned) >= 0);
         nodes.get(0).close();
         // The election initiator never announces a result; the three survivors retry.
+        await(() -> ElectionNode.compare(nodes.get(3).status().getRound(), abandoned) > 0);
         agree(4, 2, 3, 4);
         assertTrue(nodes.get(3).checkpoint("second", ByteString.copyFromUtf8("continued")));
     }

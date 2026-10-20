@@ -1,84 +1,156 @@
-# Integration contract and limits
+# Integrated election and job recovery contract
 
-## Temporary demo stubs
+## Working code
 
-`cs324.election.demo.StaticMembershipStub` is the replaceable configuration parser
-used by `WorkerMain`; it does not call a bootstrap node. Josh should replace this
-launcher boundary with discovery once the membership contract is agreed.
+Build from the repository root. Shared protocol definitions are in `protocol/`;
+application sources are separated into `bootstrap/`, `client/` and `worker/`.
+`cs324-A2/` builds the combined demo distribution. Networking, election and checkpoint recovery
+run on the same worker server, using the existing `cs324.assignment2.grpc` types.
+No fixed worker-list stub is used. Existing worker election RPC names/field tags
+are retained; epochs and recovery messages are additional fields/methods.
+All members must rebuild generated stubs from the same proto files.
 
-`cs324.election.demo.JobCheckpointStub` supplies the `save-demo` CLI fixture. Its
-payload is explicitly prefixed `STUB_ONLY`. Aveshal should use the actual job
-engine state through the existing checkpoint API; there is no simulated execution
-or claim of end-to-end job recovery behind this fixture. The automated smoke test
-checks replication/recovery of these exact stub bytes after killing the leader.
+## Bootstrap and membership
 
-## Josh: bootstrap and membership
+Bootstrap assigns worker IDs and removes workers after 5000 ms without a heartbeat;
+cleanup runs every 1000 ms. Heartbeats are sent every 1500 ms. Worker control RPCs
+have 600 ms deadlines. Monotonic time avoids wall-clock adjustments changing expiry.
 
-Construct `ElectionNode` with a unique worker endpoint, a consistent full voting
-membership list, reciprocal neighbour IDs and that worker's current JAC. Start the
-service once per worker JVM. The service presently owns its port. To share one
-worker gRPC server, register the ElectionNode service with the same ServerBuilder
-as the job service and separate server ownership from monitoring startup.
+Bootstrap exposes only RegisterWorker, DeregisterWorker, GetActiveWorkers and
+Heartbeat. It stores no election epoch, coordinator endpoint or readiness flag.
+Workers own those records through WorkerService. The lowest registered worker ID
+serializes round proposals; this role does not determine the coordinator. Election
+messages still flood the neighbour overlay, and the initiating worker collects
+EVERY current voter's candidacy before choosing lowest JAC/highest ID.
 
-The demo uses configured membership, not the old RMI bootstrap. Discovery RPCs and
-dynamic registration remain Josh's implementation. Do not remove a crashed node
-from the voting denominator independently on each worker: doing so can allow
-incompatible groups to each believe they have a majority.
+A preparation vote installs a strictly increasing epoch on current workers and
+carries the previous recovered replica configuration. All current voters must
+participate before candidacy collection can complete. Coordinator selection and
+post-recovery readiness are replicated to current workers. The elected worker
+serves only after every current voter acknowledges readiness. Clients discover
+worker endpoints through bootstrap and query WorkerService for the newest view.
+Concurrent triggers are forwarded to the round proposer; old epoch votes cannot
+replace a newer local view. A failed proposer is replaced after membership expiry.
 
-Online changes to the voting membership are NOT implemented. An added worker can
-initially be a job worker/non-voting participant; safely promoting new voters
-needs an agreed configuration transition. Broken neighbour paths also require
-bootstrap-assisted overlay repair. The election module does not currently do that.
+Membership changes invalidate readiness and start a new round. Failure of an
+election initiator is recovered through heartbeat expiry or a 12-second election
+metadata timeout. Candidate collection never concludes merely because a timer
+expired; a missing voter must report or be removed by a membership transition.
+Neighbour links retain random attachment and are repaired with a reciprocal ring
+over current voters, so losing a tree articulation worker does not strand survivors.
 
-## Aveshal: job engine
+This architecture deliberately relies on one available bootstrap for membership
+and discovery. If bootstrap is unreachable, new checkpoint admission
+fails and workers stop advertising ready leadership. Registry state is in RAM;
+its restart is outside the supported failure model. It must not be silently
+replaced with a fresh empty registry while workers continue accepting jobs.
 
-Use stable client request/job IDs and task IDs, including retry attempt IDs.
-Before acknowledging a new job, save a full checkpoint under its job ID via
-`SaveCheckpoint` or `ElectionNode.checkpoint`. A true result means a majority
-stored it. False, timeout or connection loss is an uncertain outcome: the record
-may survive recovery. Retry the SAME ID and reconcile its recorded status.
+## Recovery across configurations
 
-The payload is opaque bytes so the job service can define its own protobuf state.
-Include at least job type and full inputs, client request ID, task boundaries,
-assignments/attempts, accepted partial results, completion/progress and final result.
-Use completed records as deduplication entries; do not discard them immediately.
-Checkpoint each state transition necessary for safe recovery. Apply the same task
-result once even if a worker resends it. Reads and writes must be serialized with
-the job engine's state changes to avoid overwriting a newer state with stale data.
+Before a new coordinator becomes ready it reads a majority of the PREVIOUS ready
+voters. Each read atomically raises that replica's promised epoch before returning
+records, so it will not subsequently accept an older coordinator's checkpoint.
+The coordinator merges the newest epoch/revision per key and writes those records
+to a majority of the NEW voters before publishing readiness to the current workers.
 
-Wait for `GetStatus.ready` on the coordinator before submitting new jobs. After
-failover, `ReadRecovery` on that ready coordinator provides the recovered records.
-Resume pending tasks; reconcile in-flight tasks/results; reconnect progress streams
-using the same job ID. A checkpoint string alone is not a running job.
+A shrinking active-worker list does not lower the required OLD read quorum.
+Three previous replicas need two previous responses, even if only one remains
+registered. This prevents silently starting an empty replacement and losing jobs.
+It can reduce availability, especially if a singleton initial coordinator dies
+before its state is transitioned to a larger replica configuration.
 
-Call `recordAcceptedJob(remoteAssignments)` exactly once per new accepted client
-job, after its acceptance has been checkpointed. Pass the count of chunks assigned
-to OTHER workers. This updates JAC and starts a new election on the fifth job.
-The engine must serialize acceptance/checkpoint/count operations so concurrent jobs
-cannot exceed the term limit. Recovery must not count an old job as a new one.
-This admission transaction is an integration responsibility, not an atomic public RPC.
+RPC loss can leave an uncertain write outcome. Some stored-but-unacknowledged
+records may be recovered; callers must reconcile stable IDs rather than assume
+an unsuccessful response means no record exists. This is not a general consensus
+protocol or a proof of linearizable behaviour during arbitrary partitions.
 
-## Failure model and limitations
+## Integrated job engine
 
-* Crash-stop coordinator failures with a surviving majority of the original voting
-  configuration. Three voters tolerate one failure; five tolerate two.
-* Heartbeat RPC deadline: 600 ms, monitor delay: 400 ms, three unsuccessful checks
-  cause suspicion. Timing is not proof of death; a slow/unreachable process can be
-  suspected. Recovery time varies with RPC timeouts, rounds and checkpoint count.
-* Candidate collection lasts 1400 ms. All reachable active candidates are considered
-  only if their flood/candidacy messages arrive in this interval. This is a bounded
-  timing assumption; the code does not prove termination detection on arbitrary
-  delayed networks. There is no full Raft/Paxos consensus protocol here.
-* Logical rounds suppress duplicate/older election processing and older coordinator
-  announcements. Concurrent starts converge in a healthy connected overlay.
-* Majority replication/read repair reduces checkpoint loss under the stated crash
-  model. It does NOT establish linearizability under arbitrary network partitions,
-  overlapping leaders or reconfiguration. Do not claim general split-brain safety.
-* State is replicated in RAM. A full cluster restart loses checkpoints, JACs and
-  rounds. Restarting a crashed voter in place is not supported safely: persistent
-  epochs and state, or a controlled rejoin protocol, are needed first.
-* Plaintext trusted local demo network, no authentication/TLS.
-* Client/worker/bootstrap gRPC migration, GUI/progress, sample CSVs and job
-  reassignment are the other team portions and are not implemented in this module.
+JobGrpcServiceImpl is now registered on the same worker server. Its PersistedJob
+protobuf stores original submission, stable job ID, status and each task request,
+attempt counter, worker identity, completion state and accepted result. Records use
+the `job/` key prefix. Other checkpoint fixtures remain opaque to the job engine.
 
-These limitations must be reconciled with the group's final A2 requirements.
+Admission is replicated before acknowledgement. Task assignment, completion and
+failure transitions are checkpointed before publication; partial streamed progress
+does not generate a checkpoint for every percentage update. On a new coordinator,
+completed results are retained and unfinished attempts are rescheduled. Old-owner
+streams close with UNAVAILABLE. ResilientJobClient rediscovers the coordinator and
+resubmits/reconnects with the original request_id, preventing a second logical job.
+Clients must use distinct request IDs for distinct inputs.
+
+`SaveCheckpointRequest` accepts a stable key and opaque bytes. Include the real
+job type/full input, client request ID, task boundaries, assignments/attempt IDs,
+accepted partial results, completed task IDs, progress and final result in those
+bytes. Prefer a dedicated protobuf payload in your job module. The recovery
+service does not interpret or execute it.
+
+For a NEW client job, set `new_job=true` and `remote_assignments` to the number
+of actual allocations to OTHER workers. Use `WorkerNode.checkpointJob(request)`
+locally, or the `SaveCheckpoint` RPC. A true reply means majority replication.
+An already acknowledged/recovered admitted ID is not counted again and is not
+overwritten by a new admission request: retrieve its existing state instead.
+After five distinct successful admissions, the coordinator starts a new term.
+For real dispatch, prefer `remote_assignments=0` at admission and call
+`WorkerNode.recordRemoteAssignment(jobTaskAttemptId)` for each actual allocation
+or reassignment to another worker. Repeated allocation IDs count once. This records
+JAC separately from the five-job term count. Do not both pass an admission allocation
+count and record those same allocations through the hook. Do not count planned but
+never-issued work as dispatched. The CLI's optional allocation count is for demos.
+
+For later state updates set `new_job=false`. Preserve the admitted marker and
+serialize state transitions per job. A false reply or RPC error requires retry/
+reconciliation with the SAME job ID. These operations are guarded across concurrent
+local admissions; snapshots/replication are protected by a separate state lock.
+
+When the ready coordinator changes, call `WorkerNode.recoveredJobs()` or
+`ReadRecovery` with the current epoch, decode the saved states and reconcile live
+workers before reassigning pending work. Deduplicate task results by task/attempt
+identity; reconnect client progress streams using the original job ID. Retain
+completed job records for request deduplication. No exactly-once task execution is
+provided by the checkpoint layer itself.
+
+Do not block election/heartbeat threads with numerical computation. Use a separate
+executor. WorkerService execute RPCs now run SUM/PRIMESUM/MAX/PRIMECOUNT; JobService handles
+submission/progress. The old WorkerService SubmitJob remains UNIMPLEMENTED and
+is not used by the GUI. List values are carried through task partitioning and replicated checkpoints.
+MAX combines task maxima (including negative-only lists); PRIMECOUNT counts duplicate
+prime occurrences. CsvJobLoader and sample_jobs.csv feed concurrent GUI job rows.
+Worker details can be opened by clicking the progress bar or its details button.
+
+## Remaining boundaries
+
+In-memory replica survival covers process loss while enough previous voters and
+bootstrap remain available. Persistent JAC/epoch storage, bootstrap replication,
+full restart recovery and authentication/TLS are not implemented. A worker whose
+registration expires must stop and rejoin with a new ID; it does not silently
+resume using its old identity. Live joins are tested with checkpoint state;
+coordinator failover is also tested during a real numerical job with retained
+completed subtasks and correct final aggregation.
+
+## Latest-main integration
+
+Aveshal's PR #4 (`fcfa3bb`) is integrated with worker-owned election and checkpoint
+recovery. JobService SubmitJobRequest reserves tag 4 for repeated int64 values and
+tag 5 for stable request_id. Rebuild every client/worker before running this version;
+these stubs must not be mixed with previous local builds. Every GUI monitor uses
+ResilientJobClient while keeping its own progress row. Four jobs can be monitored
+concurrently. Both the full original list and each partition's list values are
+retained in PersistedJob/PersistedTask for coordinator recovery.
+
+## Final component and monitoring integration
+
+Joshua's branch 85d13d7, Aveshal's branch including 4f25b4e, and the worker-owned
+election/recovery commits are combined. Aveshal's task heartbeat field (tag 6) and
+Slow job/worker/task statuses are retained. Heartbeats indicate transport liveness,
+not completed work. The hard total task deadline was replaced by separate silence
+and work-stall timeouts, so a progressing task is not failed simply for taking
+longer than 60 seconds. Failed or stalled attempts are reassigned rather than
+immediately failing the entire job. Control-plane checkpoints run outside the
+cancelled task context. Same-term uncertain checkpoint writes trigger reload and
+retry rather than leaving an acknowledged job permanently paused.
+
+Build all modules with `mvnw.cmd clean verify`; do not build only the distribution
+POM before its component dependencies. Each runtime component has its own project
+and JAR. The combined demo JAR and process launch class names remain unchanged.
+Manual MAX/PRIMECOUNT list input now accompanies CSV input in the GUI.

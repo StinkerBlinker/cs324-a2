@@ -9,3 +9,8 @@ target/
 .idea/
 .vscode/
 .env
+.tools/
+.demo/
+baseline/
+*.log
+.metadata/

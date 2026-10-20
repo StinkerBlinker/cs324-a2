@@ -1,0 +1,191 @@
+syntax = "proto3";
+
+option java_multiple_files = true;
+option java_package = "cs324.assignment2.grpc";
+option java_outer_classname = "WorkerProto";
+
+package worker;
+
+import "bootstrap.proto";
+
+service WorkerService {
+  // Networking (Josh)
+  rpc AddNeighbour (AddNeighbourRequest) returns (AddNeighbourResponse);
+  rpc GetId (GetIdRequest) returns (GetIdResponse);
+  rpc GetCoordinatorId (GetCoordinatorIdRequest) returns (GetCoordinatorIdResponse);
+  rpc GetJac (GetJacRequest) returns (GetJacResponse);
+
+  // Leader Election (Pranay)
+  rpc ReceiveElectionMessage (ElectionMessage) returns (Empty);
+  rpc ReportCandidacy (CandidacyReport) returns (Empty);
+  rpc ReceiveCoordinatorMessage (CoordinatorMessage) returns (Empty);
+  rpc GetWorkerStatus (GetWorkerStatusRequest) returns (WorkerStatus);
+  rpc SaveCheckpoint (SaveCheckpointRequest) returns (CheckpointAck);
+  rpc ReadRecovery (RecoveryRequest) returns (RecoverySnapshot);
+  rpc ReplicateRecord (RecoveryRecord) returns (CheckpointAck);
+
+  // Worker-owned election metadata. Bootstrap only registers/discovers workers.
+  rpc GetClusterView (GetClusterViewRequest) returns (ClusterView);
+  rpc BeginElection (BeginElectionRequest) returns (ClusterView);
+  rpc PublishCoordinator (PublishCoordinatorRequest) returns (ClusterView);
+  rpc MarkCoordinatorReady (MarkCoordinatorReadyRequest) returns (ClusterView);
+  rpc GetElectionState (GetClusterViewRequest) returns (ElectionState);
+  rpc VoteView (ViewVoteRequest) returns (ElectionState);
+
+  // Job execution (Aveshal)
+  rpc ExecuteJob (ExecuteJobRequest) returns (ExecuteJobResponse);
+  rpc ExecuteJobWithProgress (ExecuteJobRequest) returns (stream ExecuteJobProgress);
+  rpc SubmitJob (SubmitJobRequest) returns (stream JobProgressUpdate);
+}
+
+message Empty {}
+
+message AddNeighbourRequest {
+  bootstrap.WorkerInfo neighbour = 1;
+}
+message AddNeighbourResponse {}
+
+message GetIdRequest {}
+message GetIdResponse {
+  int32 id = 1;
+}
+
+message GetCoordinatorIdRequest {}
+message GetCoordinatorIdResponse {
+  int32 coordinator_id = 1;
+}
+
+message GetJacRequest {}
+message GetJacResponse {
+  int32 jac = 1;
+}
+
+message ElectionMessage {
+  string election_id = 1;
+  bootstrap.WorkerInfo initiator = 2;
+  int64 epoch = 3;
+}
+
+message CandidacyReport {
+  bootstrap.WorkerInfo candidate = 1;
+  int32 jac = 2;
+  string election_id = 3;
+  int64 epoch = 4;
+}
+
+message CoordinatorMessage {
+  string election_id = 1;
+  bootstrap.WorkerInfo coordinator = 2;
+  int64 epoch = 3;
+}
+
+message ExecuteJobRequest {
+  string job_type = 1;
+  int32  start    = 2;
+  int32  end      = 3;
+  string task_id  = 4;
+  map<string, string> parameters = 5;
+  bytes payload = 6;
+  repeated int64 values = 7;
+}
+
+message ExecuteJobResponse {
+  int64 result = 1;
+  string task_id = 2;
+}
+
+message ExecuteJobProgress {
+  string task_id = 1;
+  double completion_percentage = 2;
+  int64 result = 3;
+  bool is_finished = 4;
+  string error_message = 5;
+  // Transport liveness only; never increments measured work.
+  bool heartbeat = 6;
+}
+
+message SubmitJobRequest {
+  string job_type = 1;
+  int32  start    = 2;
+  int32  end      = 3;
+}
+
+message JobProgressUpdate {
+  double overall_percent = 1;
+  int64  final_result    = 2;
+  bool   is_finished     = 3;
+  repeated WorkerProgress workers = 4;
+}
+
+message WorkerProgress {
+  int32  worker_id     = 1;
+  double percent_done  = 2;
+  string status        = 3;
+}
+
+message GetWorkerStatusRequest {}
+message WorkerStatus {
+  bootstrap.WorkerInfo self = 1;
+  int64 epoch = 2;
+  int32 coordinator_id = 3;
+  bool ready = 4;
+  int32 jac = 5;
+  int32 jobs_this_term = 6;
+  bool election_in_progress = 7;
+}
+message SaveCheckpointRequest {
+  string key = 1;
+  bytes payload = 2;
+  // New job admission must use a stable key; retries do not count twice.
+  bool new_job = 3;
+  int32 remote_assignments = 4;
+}
+message CheckpointAck { bool accepted = 1; string detail = 2; }
+message RecoveryRequest { int64 epoch = 1; }
+message RecoveryRecord {
+  string key = 1;
+  bytes payload = 2;
+  int64 epoch = 3;
+  int64 revision = 4;
+  bool admitted_job = 5;
+}
+message RecoverySnapshot { repeated RecoveryRecord records = 1; }
+
+message GetClusterViewRequest {}
+message ClusterView {
+  int64 epoch = 1;
+  bootstrap.WorkerInfo initiator = 2;
+  bootstrap.WorkerInfo coordinator = 3;
+  bool ready = 4;
+  repeated bootstrap.WorkerInfo voters = 5;
+  repeated bootstrap.WorkerInfo previous_voters = 6;
+  int64 membership_version = 7;
+  bool election_in_progress = 8;
+}
+message BeginElectionRequest {
+  int32 worker_id = 1;
+  int64 observed_epoch = 2;
+  bool force = 3;
+}
+message PublishCoordinatorRequest {
+  int64 epoch = 1;
+  int32 initiator_id = 2;
+  int32 coordinator_id = 3;
+}
+message MarkCoordinatorReadyRequest {
+  int64 epoch = 1;
+  int32 coordinator_id = 2;
+}
+
+enum ViewPhase { PREPARE = 0; SELECTED = 1; RECOVERED = 2; }
+message ViewVoteRequest {
+  ClusterView view = 1;
+  ClusterView previous_ready = 2;
+  ViewPhase phase = 3;
+}
+message ElectionState {
+  ClusterView current = 1;
+  ClusterView last_ready = 2;
+  int64 promised_epoch = 3;
+  bool accepted = 4;
+}
